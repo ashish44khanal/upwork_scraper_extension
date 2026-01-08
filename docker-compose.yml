@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  scraper-api:
+    build:
+      context: ./scraper_api
+      dockerfile: Dockerfile
+    container_name: scraper-api
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash-exp}
+    volumes:
+      # Mount source code for development (optional - remove in production)
+      - ./scraper_api/src:/app/src
+      # Mount scraped_jobs.json if you want to persist data
+      - ./scraper_api/src/scraped_jobs.json:/app/src/scraped_jobs.json
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
