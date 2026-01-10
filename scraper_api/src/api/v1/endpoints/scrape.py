@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from src.schemas.extraction import DOMSubmission, ExtractedData
 from src.services.gemini_extractor import GeminiExtractor
 import json
@@ -125,3 +126,54 @@ def save_to_json(data: dict):
         json.dump(jobs, f, indent=2)
     
     print(f"Saved job to {JOBS_FILE}. Total jobs: {len(jobs)}")
+
+@router.get("/download")
+async def download_scraped_jobs():
+    """
+    Download the scraped_jobs.json file.
+    Returns the entire JSON file as a downloadable attachment.
+    """
+    try:
+        # Use the same path as save_to_json (relative to working directory)
+        if not os.path.exists(JOBS_FILE):
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "File Not Found",
+                    "message": "No scraped jobs file found. Please scrape a job first.",
+                    "type": "FILE_NOT_FOUND"
+                }
+            )
+        
+        # Read the entire file content
+        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            file_content = f.read()
+        
+        # Verify it's valid JSON and contains all data
+        try:
+            jobs_data = json.loads(file_content)
+            print(f"Downloading {len(jobs_data)} job(s) from scraped_jobs.json")
+        except json.JSONDecodeError as e:
+            print(f"Warning: File contains invalid JSON: {e}")
+            # Still return the file content even if JSON is invalid
+        
+        # Return as downloadable JSON file with all content
+        return Response(
+            content=file_content,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": "attachment; filename=scraped_jobs.json"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Download error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Download Failed",
+                "message": f"Failed to download file: {str(e)}",
+                "type": "DOWNLOAD_ERROR"
+            }
+        )

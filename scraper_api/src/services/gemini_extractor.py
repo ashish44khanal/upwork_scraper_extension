@@ -165,4 +165,4 @@ Return ONLY the JSON with extracted data. NO additional text or explanations."""
             
         except Exception as e:
             print(f"Gemini extraction error: {e}")
-            return e
+            raise

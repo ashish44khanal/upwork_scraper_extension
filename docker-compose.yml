@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   scraper-api:
     build:
@@ -9,8 +7,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash-exp}
+      - GEMINI_API_KEY=AIzaSyAQl69qBzlLyC8NX1CTy33BGW2YE_BvemE
+      - GEMINI_MODEL=gemini-2.0-flash-exp
     volumes:
       # Mount source code for development (optional - remove in production)
       - ./scraper_api/src:/app/src
