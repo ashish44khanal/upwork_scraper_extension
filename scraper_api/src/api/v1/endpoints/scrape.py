@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException
+from typing import List
 from fastapi.responses import Response
-from src.schemas.extraction import DOMSubmission, ExtractedData
+from src.schemas.extraction import DOMSubmission, ExtractedData, UpworkSearchRequest
 from src.services.gemini_extractor import GeminiExtractor
+from src.services.upwork_scraper import UpworkScraper
 import json
 import os
 from datetime import datetime
@@ -84,6 +86,35 @@ async def extract_dom(submission: DOMSubmission):
                 "message": "An unexpected error occurred during processing.",
                 "type": "UNKNOWN_ERROR"
             }
+        )
+
+@router.post("/upwork", response_model=List[ExtractedData])
+async def scrape_upwork(request: UpworkSearchRequest):
+    """
+    Search and scrape jobs from Upwork based on a query.
+    Note: Requires a functional browser environment on the server.
+    """
+    try:
+        scraper = UpworkScraper(headless=request.headless)
+        results = await scraper.search_jobs(request.query, num_jobs=request.num_jobs)
+        await scraper.close()
+        
+        if not results:
+            raise HTTPException(
+                status_code=404,
+                detail="No jobs found or scraper was blocked by Cloudflare."
+            )
+            
+        return [ExtractedData(**job) for job in results]
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Upwork critical API error: {e}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Automation failure: {str(e)}"
         )
 
 def decompress_dom(compressed_b64: str) -> str:

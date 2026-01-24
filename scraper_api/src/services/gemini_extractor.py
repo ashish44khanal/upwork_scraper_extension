@@ -66,7 +66,7 @@ EXTRACTION SCHEMA:
   "total_spent":"extract the total amount spent by client so far on the platform to hire people. for example $1.4K total spent",
   "avg_hourly_rate_paid":"extract avg hourly rate paid by client. For example $8.00 /hr",
   "total_paid_hours":" extract the total hours paid by client so far. For example 88 hours",
-  "client_account_active_date:"extract the client membership data on the platform. For example Member since Apr 15, 2024",
+  "client_account_active_date":"extract the client membership data on the platform. For example Member since Apr 15, 2024",
   "no_of_proposal_received":"extract the numbers of proposals sent for this job so far under activity on this job section. For example 50+",
   "no_of_invites_sent":"extract the numbers of invites sent for this job so far under activity on this job section",
   "talent_type":"extract the text for Talent_Type under Preferred qualifications section. For example: independent",
@@ -158,7 +158,8 @@ Return ONLY the JSON with extracted data. NO additional text or explanations."""
                 "list_of_skills_and_expertise_required_for_the_job": extracted_data.get("list_of_skills_and_expertise_required_for_the_job"),
                 "client_rating_info": extracted_data.get("client_rating_info"),
                 "other_open_jobs_by_client": extracted_data.get("other_open_jobs_by_client"),
-                "client_recent_history": extracted_data.get("client_recent_history")
+                "client_recent_history": extracted_data.get("client_recent_history"),
+                "scraped_at": datetime.now().isoformat()
             }
             
             return result
