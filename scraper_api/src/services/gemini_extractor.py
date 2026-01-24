@@ -1,6 +1,7 @@
 import google.generativeai as genai
 import json
 import os
+import asyncio
 from typing import Dict, Any
 from datetime import datetime
 
@@ -168,3 +169,11 @@ Return ONLY the JSON with extracted data. NO additional text or explanations."""
         except Exception as e:
             print(f"Gemini extraction error: {e}")
             raise
+    
+    async def extract_from_html_async(self, html: str) -> Dict[str, Any]:
+        """
+        Async wrapper for extract_from_html to enable concurrent processing.
+        Runs the synchronous Gemini API call in a thread pool.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.extract_from_html, html)

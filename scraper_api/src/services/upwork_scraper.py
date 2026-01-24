@@ -4,22 +4,47 @@ import asyncio
 import random
 import logging
 import time
+import uuid
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from logging.handlers import RotatingFileHandler
 import nodriver as uc
 from bs4 import BeautifulSoup
 from src.services.gemini_extractor import GeminiExtractor
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('upwork_scraper.log')
-    ]
+from src.services.exceptions import (
+    ScraperException,
+    CloudflareBlockException,
+    ModalExtractionException,
+    AIExtractionException,
+    BrowserInitException,
+    SessionResetException
 )
+
+# Configure professional logging with rotation
+os.makedirs('logs', exist_ok=True)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Rotating file handler (10MB max, 5 backups)
+file_handler = RotatingFileHandler(
+    'logs/upwork_scraper.log',
+    maxBytes=10*1024*1024,
+    backupCount=5
+)
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter(
+    '%(asctime)s [%(levelname)s] [%(name)s] %(message)s'
+)
+file_handler.setFormatter(file_formatter)
+
+# Console handler (INFO and above)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+console_handler.setFormatter(console_formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 class UpworkScraper:
     """
@@ -34,7 +59,15 @@ class UpworkScraper:
         self.page = None
         self.output_file = "upwork.json"
         self.profile_path = os.path.join(os.getcwd(), 'upwork_profile_nd')
-        self.debug_save = True # Optional: Save local HTML files
+        self.debug_save = True
+        self.session_id = str(uuid.uuid4())[:8]  # Unique session identifier
+        self.consecutive_failures = 0  # Track failures for auto-reset
+        self.performance_metrics = {  # Track timing metrics
+            'total_time': 0,
+            'browser_init_time': 0,
+            'scraping_time': 0,
+            'ai_extraction_time': 0
+        }
 
     async def _init_browser(self):
         if not self.browser:
@@ -74,31 +107,78 @@ class UpworkScraper:
                 await asyncio.sleep(4)
         except: pass
 
+    async def _wait_for_element(self, selector: str, timeout: float = 10.0, context=None) -> bool:
+        """
+        Smart polling for element with exponential backoff.
+        Returns True if element found, False if timeout.
+        """
+        if context is None:
+            context = self.page
+            
+        start = time.time()
+        poll_interval = 0.2  # Start fast (200ms)
+        
+        while time.time() - start < timeout:
+            try:
+                element = await context.select(selector, timeout=0.5)
+                if element:
+                    elapsed = time.time() - start
+                    logger.debug(f"[Session: {self.session_id}] Element '{selector}' found in {elapsed:.2f}s")
+                    return True
+            except:
+                pass
+            
+            await asyncio.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.3, 1.5)  # Exponential backoff, cap at 1.5s
+        
+        logger.warning(f"[Session: {self.session_id}] Element '{selector}' not found after {timeout}s")
+        return False
+
+    async def _wait_for_tiles(self, selector: str, max_wait: float = 10.0) -> list:
+        """
+        Intelligent tile loading with early exit.
+        Much faster than fixed 8s wait.
+        """
+        start = time.time()
+        poll_interval = 0.3
+        
+        while time.time() - start < max_wait:
+            tiles = await self.page.select_all(selector)
+            if tiles and len(tiles) > 0:
+                elapsed = time.time() - start
+                logger.info(f"[Session: {self.session_id}] {len(tiles)} tiles loaded in {elapsed:.2f}s")
+                return tiles
+            
+            await asyncio.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.5, 2.0)
+        
+        logger.warning(f"[Session: {self.session_id}] No tiles found after {max_wait}s")
+        return []
+
     async def _find_job_frame(self):
         """
-        Helper to detect the frame containing the job slider ('air3-slider-content').
-        Scans all tab targets in the browser.
+        Helper to detect the frame containing the job slider.
         """
         try:
             # Check main page
             main_found = await self.page.select('div.air3-slider-content[data-test="UpCSliderBody"]', timeout=2)
             if main_found:
-                print("DEBUG: Found slider in main page context.")
+                logger.debug(f"[Session: {self.session_id}] Found slider in main page context")
                 return self.page
 
             # Scan all targets
-            print(f"DEBUG: Scanning {len(self.browser.targets)} targets for slider...")
+            logger.debug(f"[Session: {self.session_id}] Scanning {len(self.browser.targets)} targets for slider")
             for target in self.browser.targets:
                 try:
                     if hasattr(target, 'select'):
                         found = await target.select('div.air3-slider-content[data-test="UpCSliderBody"]', timeout=1)
                         if found:
-                            print(f"DEBUG: FOUND slider in specialization target: {getattr(target, 'url', 'Unknown')}")
+                            logger.debug(f"[Session: {self.session_id}] Found slider in specialized target")
                             return target
                 except:
                     continue
         except Exception as e:
-            print(f"DEBUG: Iframe scan error: {e}")
+            logger.error(f"[Session: {self.session_id}] Iframe scan error: {e}")
         
         return self.page
 
@@ -147,9 +227,11 @@ class UpworkScraper:
                 # 1. Wait for container presence
                 await context.select('div.air3-slider-content[data-test="UpCSliderBody"]', timeout=12)
 
-                # 2. Wait for content hydration (title present)
+                # 2. Optimized hydration polling with exponential backoff
                 start_wait = time.time()
                 hydrated = False
+                poll_interval = 0.2  # Start fast
+                
                 while time.time() - start_wait < 10:
                     try:
                         diag_data = await context.evaluate("""
@@ -167,15 +249,17 @@ class UpworkScraper:
                         """)
                         
                         if diag_data and diag_data.get('has_title'):
-                            print(f"✅ Hydration SUCCESS for Card.")
+                            elapsed = time.time() - start_wait
+                            logger.debug(f"[Session: {self.session_id}] Hydration SUCCESS in {elapsed:.2f}s")
                             hydrated = True
                             break
                         
-                        print(f"DEBUG: Syncing panel contents... (Text: {diag_data.get('text_len', 0) if diag_data else 0})")
+                        logger.debug(f"[Session: {self.session_id}] Polling... (Text: {diag_data.get('text_len', 0) if diag_data else 0})")
                     except Exception as eval_err:
-                        print(f"DEBUG: Eval error during wait: {eval_err}")
+                        logger.debug(f"[Session: {self.session_id}] Eval error: {eval_err}")
                     
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(poll_interval)
+                    poll_interval = min(poll_interval * 1.3, 1.5)  # Exponential backoff
                 
                 # 3. Capture WHOLE PAGE DOM as requested
                 print("DEBUG: Hydration confirmed. Capturing FULL DOM...")
@@ -223,38 +307,41 @@ class UpworkScraper:
         temp_html_list = []
         try:
             tile_selector = 'article.job-tile[data-test="JobTile"]'
-            print("DEBUG: Waiting 8s for tiles to load...")
-            await asyncio.sleep(8)
             
-            tiles = await self.page.select_all(tile_selector)
-            logger.info(f"Page scan complete. Total tiles discovered: {len(tiles)}")
-            print(f"\n[CONSOLE] FOUND {len(tiles)} JOB CARDS ON PAGE")
+            # OPTIMIZATION: Intelligent tile loading (was fixed 8s)
+            logger.info(f"[Session: {self.session_id}] Waiting for tiles to load...")
+            tiles = await self._wait_for_tiles(tile_selector, max_wait=10.0)
             
             if not tiles:
-                print("[CONSOLE] NO TILES FOUND.")
+                logger.warning(f"[Session: {self.session_id}] No tiles found")
                 await self.page.save_screenshot("no_tiles.png")
                 return []
 
             # Iterate through discovered tiles
             limit = min(len(tiles), num_jobs) if num_jobs > 0 else len(tiles)
+            logger.info(f"[Session: {self.session_id}] Processing {limit} job cards")
             
             for i in range(limit):
+                card_start_time = time.time()
                 try:
                     # Re-acquire tiles
                     cur_tiles = await self.page.select_all(tile_selector)
                     if i >= len(cur_tiles): break
                     tile = cur_tiles[i]
                     
-                    print(f"\n[CONSOLE] PROCESSING CARD {i+1} of {limit}")
-                    print(f"DEBUG: CLICKING CARD {i+1}...")
+                    logger.info(f"[Session: {self.session_id}] Processing card {i+1}/{limit}")
                     
                     await tile.scroll_into_view()
                     await tile.click()
                     
-                    # Wait for animation
-                    wait_time = random.uniform(2.5, 4.0)
-                    print(f"DEBUG: Waiting {wait_time:.1f}s for detail hydration...")
-                    await asyncio.sleep(wait_time)
+                    # OPTIMIZATION: Wait for slider to appear (was fixed 2.5-4s)
+                    slider_appeared = await self._wait_for_element('.air3-slider-content', timeout=5.0)
+                    if not slider_appeared:
+                        logger.warning(f"[Session: {self.session_id}] Slider didn't appear for card {i+1}")
+                        continue
+                    
+                    # Small jitter for human-like behavior
+                    await asyncio.sleep(random.uniform(0.3, 0.7))
                     
                     # Detect frame/context
                     context = await self._find_job_frame()
@@ -264,22 +351,21 @@ class UpworkScraper:
                     
                     if full_page_dom:
                         # Clean and Filter HTML on the SERVER side
-                        print(f"DEBUG: Filtering slider content from full DOM on server for Card {i+1}...")
+                        logger.debug(f"[Session: {self.session_id}] Filtering HTML for card {i+1}")
                         filtered_html = self._clean_html_server_side(full_page_dom)
                         
                         if filtered_html:
-                            # Store in requested list format
                             temp_html_list.append({f"card_{i+1}": filtered_html})
-                            print(f"✅ Card {i+1} stored (Filtered Size: {len(filtered_html)} chars)")
+                            logger.info(f"[Session: {self.session_id}] ✅ Card {i+1} stored ({len(filtered_html)} chars)")
                         else:
-                            print(f"❌ Server-side filter failed to find slider in Card {i+1} DOM.")
+                            logger.warning(f"[Session: {self.session_id}] Server-side filter failed for card {i+1}")
                     else:
-                        print(f"❌ Failed to capture full DOM for Card {i+1}")
+                        logger.warning(f"[Session: {self.session_id}] Failed to capture DOM for card {i+1}")
 
                     # Close the panel
-                    print(f"DEBUG: Closing Modal for Card {i+1}...")
+                    logger.debug(f"[Session: {self.session_id}] Closing modal for card {i+1}")
                     try:
-                        back_btn = await context.select('button.air3-slider-prev-btn', timeout=3)
+                        back_btn = await context.select('button.air3-slider-prev-btn', timeout=2)
                         if back_btn:
                             await back_btn.click()
                         else:
@@ -288,7 +374,22 @@ class UpworkScraper:
                         try: await self.page.send_keys("\uE00C")
                         except: pass
                     
-                    await asyncio.sleep(random.uniform(1.2, 2.5))
+                    # OPTIMIZATION: Wait for slider to disappear (was fixed 1.2-2.5s)
+                    close_start = time.time()
+                    while time.time() - close_start < 3.0:
+                        try:
+                            slider = await self.page.select('.air3-slider-content', timeout=0.3)
+                            if not slider:
+                                break
+                        except:
+                            break
+                        await asyncio.sleep(0.2)
+                    
+                    # Small random delay between cards
+                    await asyncio.sleep(random.uniform(0.4, 0.8))
+                    
+                    card_time = time.time() - card_start_time
+                    logger.debug(f"[Session: {self.session_id}] Card {i+1} processed in {card_time:.2f}s")
                         
                 except Exception as e:
                     logger.error(f"Card {i+1} interaction error: {e}")
@@ -300,34 +401,72 @@ class UpworkScraper:
             logger.error(f"Global extraction failure: {e}")
             print(f"[CONSOLE] CRITICAL FAILURE: {e}")
 
-        # 3. Post-Process with Gemini AI Extraction
+        # 3. Post-Process with Concurrent Gemini AI Extraction
         print("\n" + "="*50)
-        print("DEBUG: Starting AI Extraction phase...")
-        response_content = []
+        logger.info(f"[Session: {self.session_id}] Starting concurrent AI extraction for {len(temp_html_list)} cards")
         
-        for item in temp_html_list:
-            # item is {"card_N": "html_content"}
+        ai_start_time = time.time()
+        response_content = []
+        failed_extractions = []
+        
+        # Create concurrent extraction tasks
+        async def extract_single_card(item: Dict[str, str], index: int) -> Optional[Dict[str, Any]]:
+            """Extract data from a single card with error handling"""
             card_key = list(item.keys())[0]
             html_content = item[card_key]
             
             if not html_content:
-                continue
+                logger.warning(f"[Session: {self.session_id}] Empty HTML for {card_key}")
+                return None
                 
-            print(f"DEBUG: Extracting data for {card_key}...")
             try:
-                # Use the existing GeminiExtractor
-                data = self.extractor.extract_from_html(html_content)
+                logger.debug(f"[Session: {self.session_id}] Extracting data for {card_key}...")
+                data = await self.extractor.extract_from_html_async(html_content)
                 if data:
-                    print(f"✅ AI Extraction SUCCESS for {card_key}")
-                    response_content.append(data)
+                    logger.info(f"[Session: {self.session_id}] ✅ AI Extraction SUCCESS for {card_key}")
+                    self.consecutive_failures = 0  # Reset failure counter
+                    return data
                 else:
-                    print(f"⚠️ AI returned empty data for {card_key}")
+                    logger.warning(f"[Session: {self.session_id}] AI returned empty data for {card_key}")
+                    return None
             except Exception as e:
-                print(f"❌ AI Extraction FAILED for {card_key}: {e}")
+                logger.error(f"[Session: {self.session_id}] ❌ AI Extraction FAILED for {card_key}: {e}")
+                self.consecutive_failures += 1
+                failed_extractions.append(index + 1)
+                return None
+        
+        # Execute all extractions concurrently
+        extraction_tasks = [
+            extract_single_card(item, i) 
+            for i, item in enumerate(temp_html_list)
+        ]
+        
+        results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+        
+        # Filter out None and exceptions
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"[Session: {self.session_id}] Exception in extraction {i+1}: {result}")
+                failed_extractions.append(i + 1)
+            elif result is not None:
+                response_content.append(result)
+        
+        ai_extraction_time = time.time() - ai_start_time
+        self.performance_metrics['ai_extraction_time'] = ai_extraction_time
+        
+        # Log performance metrics
+        logger.info(f"[Session: {self.session_id}] AI Extraction completed in {ai_extraction_time:.2f}s")
+        logger.info(f"[Session: {self.session_id}] Success: {len(response_content)}/{len(temp_html_list)} cards")
+        if failed_extractions:
+            logger.warning(f"[Session: {self.session_id}] Failed cards: {failed_extractions}")
 
-        # Final print as explicitly requested
+        # Final print
         print("\n" + "="*50)
-        print("[CONSOLE] SCRAPING & EXTRACTION COMPLETE. FINAL DATA:")
+        print(f"[CONSOLE] SCRAPING & EXTRACTION COMPLETE")
+        print(f"[CONSOLE] Session ID: {self.session_id}")
+        print(f"[CONSOLE] Success Rate: {len(response_content)}/{len(temp_html_list)} cards")
+        print(f"[CONSOLE] AI Extraction Time: {ai_extraction_time:.2f}s")
+        print(f"[CONSOLE] FINAL DATA:")
         print(json.dumps(response_content, indent=2))
         print("="*50 + "\n")
         
