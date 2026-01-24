@@ -2,6 +2,7 @@ import google.generativeai as genai
 import json
 import os
 from typing import Dict, Any
+from datetime import datetime
 
 class GeminiExtractor:
     """
@@ -15,7 +16,7 @@ class GeminiExtractor:
             raise ValueError("GEMINI_API_KEY environment variable not set")
         
         genai.configure(api_key=api_key)
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         
         # Configure generation with strict JSON output
         generation_config = {

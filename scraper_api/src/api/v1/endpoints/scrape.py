@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from typing import List
+from typing import List, Any
 from fastapi.responses import Response
 from src.schemas.extraction import DOMSubmission, ExtractedData, UpworkSearchRequest
 from src.services.gemini_extractor import GeminiExtractor

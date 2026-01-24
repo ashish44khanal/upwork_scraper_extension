@@ -38,7 +38,7 @@ class ExtractedData(BaseModel):
     
     # Skills and Lists
     list_of_skills_and_expertise_required_for_the_job: Optional[List[str]] = None
-    client_rating_info: Optional[Dict[str, str]] = None
+    client_rating_info: Optional[Dict[str, Optional[str]]] = None
     other_open_jobs_by_client: Optional[Dict[str, Any]] = None
     client_recent_history: Optional[Dict[str, Any]] = None
     scraped_at: Optional[str] = None
