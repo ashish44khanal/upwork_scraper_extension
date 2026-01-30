@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from typing import List, Any
 from fastapi.responses import Response
-from src.schemas.extraction import DOMSubmission, ExtractedData, UpworkSearchRequest
+from src.schemas.extraction import DOMSubmission, ExtractedData, UpworkSearchRequest, UpworkScrapeRequest
 from src.services.gemini_extractor import GeminiExtractor
 from src.services.upwork_scraper import UpworkScraper
 import json
@@ -89,14 +89,18 @@ async def extract_dom(submission: DOMSubmission):
         )
 
 @router.post("/upwork", response_model=List[ExtractedData])
-async def scrape_upwork(request: UpworkSearchRequest):
+async def scrape_upwork(request: UpworkScrapeRequest):
     """
-    Search and scrape jobs from Upwork based on a query.
-    Note: Requires a functional browser environment on the server.
+    Scrape jobs from Upwork at the given product URL.
+    Uses persistent session (cookies.json); logs in only when needed.
+    Requires UPWORK_USERNAME/UPWORK_PASSWORD in env when login is required.
     """
     try:
         scraper = UpworkScraper(headless=request.headless)
-        results = await scraper.search_jobs(request.query, num_jobs=request.num_jobs)
+        results = await scraper.scrape_jobs(
+            product_url=request.product_url,
+            num_jobs=request.num_jobs,
+        )
         await scraper.close()
         
         if not results:

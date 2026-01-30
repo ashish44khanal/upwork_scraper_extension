@@ -9,6 +9,13 @@ class UpworkSearchRequest(BaseModel):
     num_jobs: Optional[int] = 5
     headless: Optional[bool] = False
 
+
+class UpworkScrapeRequest(BaseModel):
+    """Request to scrape jobs from a product/search URL (requires login)."""
+    product_url: str
+    num_jobs: Optional[int] = 5
+    headless: Optional[bool] = False
+
 class ExtractedData(BaseModel):
     # Core job fields - all optional
     job_title: Optional[str] = None

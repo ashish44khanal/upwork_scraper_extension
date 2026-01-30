@@ -31,6 +31,7 @@ ENV/
 # Scraper Specific
 upwork_profile/
 upwork_profile_nd/
+cookies.json
 *.log
 upwork.json
 scraped_jobs.json
