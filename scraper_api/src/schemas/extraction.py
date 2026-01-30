@@ -13,7 +13,7 @@ class UpworkSearchRequest(BaseModel):
 class UpworkScrapeRequest(BaseModel):
     """Request to scrape jobs from a product/search URL (requires login)."""
     product_url: str
-    num_jobs: Optional[int] = 5
+    no_of_pages_to_scrape: Optional[int] = None  # None = all pages; 1, 2, 3... = up to that many pages
     headless: Optional[bool] = False
 
 class ExtractedData(BaseModel):

@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import math
 import asyncio
 import random
 import logging
@@ -7,11 +9,13 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from logging.handlers import RotatingFileHandler
 # Nodriver: https://github.com/ultrafunkamsterdam/nodriver
 # Docs: https://ultrafunkamsterdam.github.io/nodriver/
 import nodriver as uc
+from nodriver import cdp
 from dotenv import load_dotenv
 
 # Scraper root (scraper_api/) for .env path
@@ -335,6 +339,81 @@ class UpworkScraper:
         logger.warning(f"[Session: {self.session_id}] No tiles found after {max_wait}s")
         return []
 
+    def _build_next_page_url(self, base_url: str, page_num: int) -> str:
+        """Add or replace page=N in product_url for pagination."""
+        parsed = urlparse(base_url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs["page"] = [str(page_num)]
+        new_query = urlencode(qs, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+
+    async def _get_pagination_from_dom(self) -> Optional[Dict[str, Any]]:
+        """
+        Parse pagination from DOM: ul[data-test="pagination"], li[data-test="pagination-mobile"] "X of Y".
+        Returns {"total_pages": int, "current_page": int, "has_next": bool} or None.
+        """
+        try:
+            mobile_el = await self.page.select('li[data-test="pagination-mobile"]', timeout=3)
+            if not mobile_el:
+                return {"total_pages": 1, "current_page": 1, "has_next": False}
+            text = getattr(mobile_el, "text_all", None) or getattr(mobile_el, "text", "") or ""
+            text = str(text).strip()
+            match = re.search(r"(\d+)\s+of\s+(\d+)", text.strip())
+            if not match:
+                return {"total_pages": 1, "current_page": 1, "has_next": False}
+            current_page = int(match.group(1))
+            total_pages = int(match.group(2))
+            next_el = await self.page.select('a[data-test="next-page"]:not(.is-disabled)', timeout=1)
+            has_next = bool(next_el) and total_pages > 1 and current_page < total_pages
+            return {"total_pages": total_pages, "current_page": current_page, "has_next": has_next}
+        except Exception as e:
+            logger.debug(f"DOM pagination parse failed: {e}")
+        return {"total_pages": 1, "current_page": 1, "has_next": False}
+
+    def _parse_paging_from_response_body(self, body_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse data.data.search.universalSearchNuxt.userJobSearchV1.paging from GraphQL response.
+        Returns {"total_pages": int, "current_page": int} or None.
+        """
+        try:
+            data = json.loads(body_str)
+            paging = (data.get("data") or {}).get("search") or {}
+            paging = (paging.get("universalSearchNuxt") or {}).get("userJobSearchV1") or {}
+            paging = paging.get("paging")
+            if not paging:
+                return None
+            total = int(paging.get("total") or 0)
+            offset = int(paging.get("offset") or 0)
+            count = int(paging.get("count") or 10)
+            if count <= 0:
+                return None
+            total_pages = math.ceil(total / count) if total else 1
+            current_page = (offset // count) + 1 if offset is not None else 1
+            return {"total_pages": total_pages, "current_page": current_page}
+        except Exception as e:
+            logger.debug(f"API paging parse failed: {e}")
+        return None
+
+    async def _get_total_pages_after_navigate(self, graphql_request_id_queue: asyncio.Queue) -> Optional[Dict[str, Any]]:
+        """
+        After navigate: wait for userJobSearch response request_id from queue, get body, parse paging.
+        Returns {"total_pages": int, "current_page": int} or None (then use DOM fallback).
+        """
+        try:
+            request_id = await asyncio.wait_for(graphql_request_id_queue.get(), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.debug("No userJobSearch response within 15s; will use DOM pagination")
+            return None
+        try:
+            body, base64_encoded = await self.page.send(cdp.network.get_response_body(request_id), True)
+            if base64_encoded:
+                import base64
+                body = base64.b64decode(body).decode("utf-8", errors="replace")
+            return self._parse_paging_from_response_body(body)
+        except Exception as e:
+            logger.debug(f"getResponseBody or parse failed: {e}")
+        return None
+
     async def _find_job_frame(self):
         """
         Helper to detect the frame containing the job slider.
@@ -458,124 +537,161 @@ class UpworkScraper:
         print("❌ Failed to capture full DOM after retries.")
         return None
 
-    async def scrape_jobs(self, product_url: str, num_jobs: int = 5) -> List[Dict[str, Any]]:
-        """Scrape jobs from the given product URL. Uses persistent session; logs in when needed."""
+    async def scrape_jobs(self, product_url: str, no_of_pages_to_scrape: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Scrape jobs from the given product URL across one or more pages. no_of_pages_to_scrape: None = all pages; 1,2,3... = up to that many pages."""
         try:
             try:
                 loop = asyncio.get_running_loop()
-                return await self._scrape_jobs_from_url(product_url, num_jobs)
+                return await self._scrape_jobs_from_url(product_url, no_of_pages_to_scrape)
             except RuntimeError:
-                return asyncio.run(self._scrape_jobs_from_url(product_url, num_jobs))
+                return asyncio.run(self._scrape_jobs_from_url(product_url, no_of_pages_to_scrape))
         except Exception as e:
             import traceback
             logger.error(f"Scrape failed: {e}")
             traceback.print_exc()
             return []
 
-    async def search_jobs(self, query: str, num_jobs: int = 5) -> List[Dict[str, Any]]:
+    async def search_jobs(self, query: str, no_of_pages_to_scrape: Optional[int] = None) -> List[Dict[str, Any]]:
         """Backward-compat: build search URL from query and scrape."""
         search_url = f"https://www.upwork.com/nx/search/jobs/?q={query.replace(' ', '%20')}"
-        return await self.scrape_jobs(search_url, num_jobs=num_jobs)
+        return await self.scrape_jobs(search_url, no_of_pages_to_scrape=no_of_pages_to_scrape)
 
-    async def _scrape_jobs_from_url(self, product_url: str, num_jobs: int = 5) -> List[Dict[str, Any]]:
+    async def _scrape_jobs_from_url(self, product_url: str, no_of_pages_to_scrape: Optional[int] = None) -> List[Dict[str, Any]]:
         await self._init_browser()
         await self._ensure_session()
+
+        # Queue for GraphQL userJobSearch response request_id (handler runs in same tab)
+        graphql_queue: asyncio.Queue = asyncio.Queue()
+
+        def on_response_received(event):
+            try:
+                if "userJobSearch" in (getattr(event.response, "url", None) or ""):
+                    graphql_queue.put_nowait(event.request_id)
+            except Exception:
+                pass
+
+        self.page.add_handler(cdp.network.ResponseReceived, on_response_received)
+        try:
+            await self.page.send(cdp.network.enable(), True)
+        except Exception as e:
+            logger.debug(f"Network.enable failed: {e}")
         logger.info(f"Navigating to product URL: {product_url}")
         await self.page.get(product_url)
         await self._wait_for_cloudflare()
-        # Extract - All Job Tiles & Page DOM
-        temp_html_list = []
+
+        # Get total pages: try GraphQL response first, then DOM fallback
+        paging = await self._get_total_pages_after_navigate(graphql_queue)
+        self.page.remove_handler(cdp.network.ResponseReceived, on_response_received)
         try:
-            tile_selector = 'article.job-tile[data-test="JobTile"]'
-            
-            # OPTIMIZATION: Intelligent tile loading (was fixed 8s)
-            logger.info(f"[Session: {self.session_id}] Waiting for tiles to load...")
-            tiles = await self._wait_for_tiles(tile_selector, max_wait=10.0)
-            
-            if not tiles:
-                logger.warning(f"[Session: {self.session_id}] No tiles found")
-                await self.page.save_screenshot("no_tiles.png")
-                return []
+            await self.page.send(cdp.network.disable(), True)
+        except Exception:
+            pass
+        if paging is None:
+            paging = await self._get_pagination_from_dom()
+        total_pages = paging.get("total_pages", 1) or 1
+        if no_of_pages_to_scrape is not None and no_of_pages_to_scrape <= 0:
+            return []
+        pages_to_scrape = total_pages if no_of_pages_to_scrape is None else min(no_of_pages_to_scrape, total_pages)
+        logger.info(f"[Session: {self.session_id}] Scraping {pages_to_scrape} page(s) (total available: {total_pages})")
 
-            # Iterate through discovered tiles
-            limit = min(len(tiles), num_jobs) if num_jobs > 0 else len(tiles)
-            logger.info(f"[Session: {self.session_id}] Processing {limit} job cards")
-            
-            for i in range(limit):
-                card_start_time = time.time()
-                try:
-                    # Re-acquire tiles
-                    cur_tiles = await self.page.select_all(tile_selector)
-                    if i >= len(cur_tiles): break
-                    tile = cur_tiles[i]
-                    
-                    logger.info(f"[Session: {self.session_id}] Processing card {i+1}/{limit}")
-                    
-                    await tile.scroll_into_view()
-                    await tile.click()
-                    
-                    # OPTIMIZATION: Wait for slider to appear (was fixed 2.5-4s)
-                    slider_appeared = await self._wait_for_element('.air3-slider-content', timeout=5.0)
-                    if not slider_appeared:
-                        logger.warning(f"[Session: {self.session_id}] Slider didn't appear for card {i+1}")
-                        continue
-                    
-                    # Small jitter for human-like behavior
-                    await asyncio.sleep(random.uniform(0.3, 0.7))
-                    
-                    # Detect frame/context
-                    context = await self._find_job_frame()
-                    
-                    # Extract WHOLE PAGE HTML
-                    full_page_dom = await self._extract_job_modal(context=context)
-                    
-                    if full_page_dom:
-                        # Clean and Filter HTML on the SERVER side
-                        logger.debug(f"[Session: {self.session_id}] Filtering HTML for card {i+1}")
-                        filtered_html = self._clean_html_server_side(full_page_dom)
-                        
-                        if filtered_html:
-                            temp_html_list.append({f"card_{i+1}": filtered_html})
-                            logger.info(f"[Session: {self.session_id}] ✅ Card {i+1} stored ({len(filtered_html)} chars)")
-                        else:
-                            logger.warning(f"[Session: {self.session_id}] Server-side filter failed for card {i+1}")
-                    else:
-                        logger.warning(f"[Session: {self.session_id}] Failed to capture DOM for card {i+1}")
+        temp_html_list = []
+        tile_selector = 'article.job-tile[data-test="JobTile"]'
+        try:
+            for page_num in range(1, pages_to_scrape + 1):
+                if page_num > 1:
+                    next_url = self._build_next_page_url(product_url, page_num)
+                    logger.info(f"[Session: {self.session_id}] Navigating to page {page_num}: {next_url[:80]}...")
+                    await self.page.get(next_url)
+                    await self._wait_for_cloudflare()
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
 
-                    # Close the panel
-                    logger.debug(f"[Session: {self.session_id}] Closing modal for card {i+1}")
+                logger.info(f"[Session: {self.session_id}] Waiting for tiles on page {page_num}...")
+                tiles = await self._wait_for_tiles(tile_selector, max_wait=10.0)
+                if not tiles:
+                    logger.warning(f"[Session: {self.session_id}] No tiles on page {page_num}")
+                    if page_num == 1:
+                        await self.page.save_screenshot("no_tiles.png")
+                    continue
+
+                limit = len(tiles)
+                logger.info(f"[Session: {self.session_id}] Processing {limit} job cards on page {page_num}/{pages_to_scrape}")
+
+                card_base = len(temp_html_list)
+                for i in range(limit):
+                    card_start_time = time.time()
                     try:
-                        back_btn = await context.select('button.air3-slider-prev-btn', timeout=2)
-                        if back_btn:
-                            await back_btn.click()
+                        # Re-acquire tiles
+                        cur_tiles = await self.page.select_all(tile_selector)
+                        if i >= len(cur_tiles): break
+                        tile = cur_tiles[i]
+                        card_index = card_base + i + 1
+                        logger.info(f"[Session: {self.session_id}] Processing card {card_index} (page {page_num}: {i+1}/{limit})")
+                        
+                        await tile.scroll_into_view()
+                        await tile.click()
+                        
+                        # OPTIMIZATION: Wait for slider to appear (was fixed 2.5-4s)
+                        slider_appeared = await self._wait_for_element('.air3-slider-content', timeout=5.0)
+                        if not slider_appeared:
+                            logger.warning(f"[Session: {self.session_id}] Slider didn't appear for card {card_index}")
+                            continue
+                        
+                        # Small jitter for human-like behavior
+                        await asyncio.sleep(random.uniform(0.3, 0.7))
+                        
+                        # Detect frame/context
+                        context = await self._find_job_frame()
+                        
+                        # Extract WHOLE PAGE HTML
+                        full_page_dom = await self._extract_job_modal(context=context)
+                        
+                        if full_page_dom:
+                            # Clean and Filter HTML on the SERVER side
+                            logger.debug(f"[Session: {self.session_id}] Filtering HTML for card {card_index}")
+                            filtered_html = self._clean_html_server_side(full_page_dom)
+                            
+                            if filtered_html:
+                                temp_html_list.append({f"card_{card_index}": filtered_html})
+                                logger.info(f"[Session: {self.session_id}] ✅ Card {card_index} stored ({len(filtered_html)} chars)")
+                            else:
+                                logger.warning(f"[Session: {self.session_id}] Server-side filter failed for card {card_index}")
                         else:
-                            await self.page.send_keys("\uE00C")
-                    except:
+                            logger.warning(f"[Session: {self.session_id}] Failed to capture DOM for card {card_index}")
+
+                        # Close the panel
+                        logger.debug(f"[Session: {self.session_id}] Closing modal for card {card_index}")
+                        try:
+                            back_btn = await context.select('button.air3-slider-prev-btn', timeout=2)
+                            if back_btn:
+                                await back_btn.click()
+                            else:
+                                await self.page.send_keys("\uE00C")
+                        except:
+                            try: await self.page.send_keys("\uE00C")
+                            except: pass
+                        
+                        # OPTIMIZATION: Wait for slider to disappear (was fixed 1.2-2.5s)
+                        close_start = time.time()
+                        while time.time() - close_start < 3.0:
+                            try:
+                                slider = await self.page.select('.air3-slider-content', timeout=0.3)
+                                if not slider:
+                                    break
+                            except:
+                                break
+                            await asyncio.sleep(0.2)
+                        
+                        # Small random delay between cards
+                        await asyncio.sleep(random.uniform(0.4, 0.8))
+                        
+                        card_time = time.time() - card_start_time
+                        logger.debug(f"[Session: {self.session_id}] Card {card_index} processed in {card_time:.2f}s")
+                            
+                    except Exception as e:
+                        logger.error(f"Card {card_base + i + 1} interaction error: {e}")
+                        print(f"[CONSOLE] ERROR ON CARD {card_base + i + 1}: {e}")
                         try: await self.page.send_keys("\uE00C")
                         except: pass
-                    
-                    # OPTIMIZATION: Wait for slider to disappear (was fixed 1.2-2.5s)
-                    close_start = time.time()
-                    while time.time() - close_start < 3.0:
-                        try:
-                            slider = await self.page.select('.air3-slider-content', timeout=0.3)
-                            if not slider:
-                                break
-                        except:
-                            break
-                        await asyncio.sleep(0.2)
-                    
-                    # Small random delay between cards
-                    await asyncio.sleep(random.uniform(0.4, 0.8))
-                    
-                    card_time = time.time() - card_start_time
-                    logger.debug(f"[Session: {self.session_id}] Card {i+1} processed in {card_time:.2f}s")
-                        
-                except Exception as e:
-                    logger.error(f"Card {i+1} interaction error: {e}")
-                    print(f"[CONSOLE] ERROR ON CARD {i+1}: {e}")
-                    try: await self.page.send_keys("\uE00C")
-                    except: pass
                     
         except Exception as e:
             logger.error(f"Global extraction failure: {e}")
@@ -646,8 +762,7 @@ class UpworkScraper:
         print(f"[CONSOLE] Session ID: {self.session_id}")
         print(f"[CONSOLE] Success Rate: {len(response_content)}/{len(temp_html_list)} cards")
         print(f"[CONSOLE] AI Extraction Time: {ai_extraction_time:.2f}s")
-        print(f"[CONSOLE] FINAL DATA:")
-        print(json.dumps(response_content, indent=2))
+        
         print("="*50 + "\n")
         
         return response_content
@@ -664,7 +779,7 @@ if __name__ == "__main__":
     try:
         if os.getenv("GEMINI_API_KEY"):
             product_url = "https://www.upwork.com/nx/search/jobs/?q=React%20Developer"
-            asyncio.run(scraper.scrape_jobs(product_url, num_jobs=1))
+            asyncio.run(scraper.scrape_jobs(product_url, no_of_pages_to_scrape=1))
         else:
             print("Set GEMINI_API_KEY")
     finally:

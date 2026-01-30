@@ -91,14 +91,15 @@ async def extract_dom(submission: DOMSubmission):
 @router.post("/upwork", response_model=List[ExtractedData])
 async def scrape_upwork(request: UpworkScrapeRequest):
     """
-    Scrape jobs from Upwork at the given product URL.
+    Scrape jobs from Upwork at the given product URL across one or more pages.
+    no_of_pages_to_scrape: null = all pages; 1, 2, 3... = up to that many pages.
     Logs in each run using UPWORK_USERNAME/UPWORK_PASSWORD from env.
     """
     try:
         scraper = UpworkScraper(headless=request.headless)
         results = await scraper.scrape_jobs(
             product_url=request.product_url,
-            num_jobs=request.num_jobs,
+            no_of_pages_to_scrape=request.no_of_pages_to_scrape,
         )
         await scraper.close()
         

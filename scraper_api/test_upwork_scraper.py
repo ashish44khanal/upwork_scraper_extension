@@ -27,8 +27,8 @@ async def test_scrape():
     scraper = UpworkScraper(headless=False)  # headless=True for CI
     try:
         product_url = "https://www.upwork.com/nx/search/jobs/?q=python"
-        print("Testing scrape_jobs(product_url, num_jobs=1)...")
-        results = await scraper.scrape_jobs(product_url, num_jobs=1)
+        print("Testing scrape_jobs(product_url, no_of_pages_to_scrape=1)...")
+        results = await scraper.scrape_jobs(product_url, no_of_pages_to_scrape=1)
         print(f"Results: {len(results)} job(s)")
         if results:
             print("First job title:", results[0].get("job_title"))
