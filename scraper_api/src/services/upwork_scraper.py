@@ -14,8 +14,9 @@ from logging.handlers import RotatingFileHandler
 import nodriver as uc
 from dotenv import load_dotenv
 
-# Load .env from project root (scraper_api/.env) so UPWORK_* and GEMINI_* are available
-_load_dotenv_path = Path(__file__).resolve().parent.parent.parent / ".env"
+# Scraper root (scraper_api/) for .env path
+_scraper_root = Path(__file__).resolve().parent.parent.parent
+_load_dotenv_path = _scraper_root / ".env"
 load_dotenv(dotenv_path=_load_dotenv_path)
 from bs4 import BeautifulSoup
 from src.services.gemini_extractor import GeminiExtractor
@@ -54,14 +55,13 @@ console_handler.setFormatter(console_formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# Upwork login and session persistence
+# Upwork login
 LOGIN_URL = "https://www.upwork.com/ab/account-security/login"
-PROFILE_URL = "https://www.upwork.com/ab/account-security/"
 
 class UpworkScraper:
     """
     Elite Stealth Scraper using Nodriver (CDP-based).
-    Uses persistent session (cookies.json); logs in only when needed.
+    Logs in on each run using UPWORK_USERNAME and UPWORK_PASSWORD from .env.
     """
     
     def __init__(self, headless: bool = False):
@@ -71,9 +71,7 @@ class UpworkScraper:
         self.page = None
         self.output_file = "upwork.json"
         self.profile_path = os.path.join(os.getcwd(), 'upwork_profile_nd')
-        self.cookies_path = os.path.join(os.getcwd(), os.getenv("UPWORK_COOKIES_PATH", "cookies.json"))
         self.login_url = LOGIN_URL
-        self.profile_url = os.getenv("UPWORK_PROFILE_URL", PROFILE_URL)
         self.debug_save = True
         self.session_id = str(uuid.uuid4())[:8]  # Unique session identifier
         self.consecutive_failures = 0  # Track failures for auto-reset
@@ -102,119 +100,21 @@ class UpworkScraper:
             self.page = await self.browser.get("https://www.google.com/search?q=upwork+jobs")
             await asyncio.sleep(3)
 
-    def _get_cdp_connection(self):
-        """Get CDP connection from page or browser for cookie get/set."""
-        conn = getattr(self.page, "connection", None) if self.page else None
-        if conn is None and self.browser:
-            conn = getattr(self.browser, "connection", None)
-        return conn
-
-    async def _get_cookies_via_cdp(self) -> Optional[List[Dict[str, Any]]]:
-        """Get cookies for Upwork domain via CDP. Returns None if CDP unavailable."""
-        try:
-            conn = self._get_cdp_connection()
-            if conn is None:
-                return None
-            # CDP Network.getCookies
-            result = await conn.send("Network.getCookies", {"urls": ["https://www.upwork.com"]})
-            if result and isinstance(result, dict) and "cookies" in result:
-                logger.info("Session: got cookies via CDP")
-                return result["cookies"]
-        except Exception as e:
-            logger.debug(f"CDP getCookies failed: {e}")
-        return None
-
-    async def _set_cookies_via_cdp(self, cookies: List[Dict[str, Any]]) -> bool:
-        """Set cookies via CDP. Must be on Upwork domain first. Returns True if applied."""
-        if not cookies:
-            return True
-        try:
-            conn = self._get_cdp_connection()
-            if conn is None:
-                return False
-            for c in cookies:
-                params = {
-                    "name": c.get("name"),
-                    "value": c.get("value"),
-                    "domain": c.get("domain", ".upwork.com"),
-                    "path": c.get("path", "/"),
-                }
-                if c.get("secure"):
-                    params["secure"] = True
-                if c.get("httpOnly"):
-                    params["httpOnly"] = True
-                if c.get("expires") and c["expires"] != -1:
-                    params["expires"] = c["expires"]
-                await conn.send("Network.setCookie", params)
-            logger.info("Session: applied cookies via CDP")
-            return True
-        except Exception as e:
-            logger.debug(f"CDP setCookie failed: {e}")
-        return False
-
-    def _load_cookies(self, path: str) -> Optional[List[Dict[str, Any]]]:
-        """Read cookies from JSON file. Do not log cookie values."""
-        try:
-            if not os.path.exists(path):
-                return None
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list) and len(data) > 0:
-                logger.info("Session loaded from file")
-                return data
-            return None
-        except Exception as e:
-            logger.warning(f"Session file load failed: {e}")
-        return None
-
-    async def _save_cookies(self, path: str) -> None:
-        """Save cookies to JSON file with owner-only permissions. Do not log cookie values."""
-        cookies = await self._get_cookies_via_cdp()
-        if not cookies:
-            logger.debug("Session: no cookies to save (CDP may be unavailable)")
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(cookies, f, indent=2)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-            logger.info("Session saved")
-        except Exception as e:
-            logger.warning(f"Session file save failed: {e}")
-
-    async def _validate_session(self) -> bool:
-        """Open Profile URL and check if logged in (no login form)."""
-        try:
-            await self.page.get(self.profile_url)
-            await asyncio.sleep(2)
-            await self._wait_for_cloudflare()
-            # Logged in if login form is absent
-            login_input = await self._select_login_username(timeout=3)
-            if login_input:
-                logger.info("Session invalid: login form present")
-                return False
-            logger.info("Session valid")
-            return True
-        except Exception as e:
-            logger.warning(f"Session validation failed: {e}")
-        return False
-
     async def _human_delay(self, min_sec: float = 0.3, max_sec: float = 0.8):
         """Random delay to mimic human; reduces antibot detection."""
         await asyncio.sleep(random.uniform(min_sec, max_sec))
 
     async def _human_type(self, element, text: str):
-        """Type into element with human-like pacing (nodriver Element has send_keys only)."""
+        """Type at normal human speed (~40–60 WPM): ~150–280ms per key, longer pause after @ and ."""
         await element.focus()
-        await self._human_delay(0.15, 0.35)
-        # Send in small chunks with micro-delays to avoid instant paste detection
-        chunk_size = random.randint(2, 5)
-        for i in range(0, len(text), chunk_size):
-            chunk = text[i : i + chunk_size]
-            await element.send_keys(chunk)
-            await asyncio.sleep(random.uniform(0.05, 0.15))
+        await self._human_delay(0.2, 0.45)
+        for i, char in enumerate(text):
+            await element.send_keys(char)
+            # Human-like delay: 150–280ms typical; 250–450ms after @ or . (natural hesitation)
+            if char in "@.":
+                await asyncio.sleep(random.uniform(0.25, 0.5))
+            else:
+                await asyncio.sleep(random.uniform(0.12, 0.28))
 
     async def _select_login_username(self, timeout: float = 10):
         """Try multiple selectors for Upwork username field; returns first found or None."""
@@ -290,6 +190,11 @@ class UpworkScraper:
             except Exception:
                 pass
             await self._human_delay(0.2, 0.5)
+            try:
+                await un.clear_input()
+            except Exception:
+                pass
+            await self._human_delay(0.15, 0.35)
             await self._human_type(un, username)
             await self._human_delay(0.4, 0.9)
 
@@ -317,6 +222,11 @@ class UpworkScraper:
             except Exception:
                 pass
             await self._human_delay(0.2, 0.5)
+            try:
+                await pw.clear_input()
+            except Exception:
+                pass
+            await self._human_delay(0.15, 0.35)
             await self._human_type(pw, password)
             await self._human_delay(0.4, 0.9)
 
@@ -346,22 +256,10 @@ class UpworkScraper:
         return False
 
     async def _ensure_session(self) -> None:
-        """Ensure we have a valid logged-in session: load cookies and validate, or login and save."""
-        # 1. Try load cookies and validate
-        if os.path.exists(self.cookies_path):
-            cookies = self._load_cookies(self.cookies_path)
-            if cookies:
-                await self.page.get("https://www.upwork.com/")
-                await asyncio.sleep(1)
-                applied = await self._set_cookies_via_cdp(cookies)
-                if applied:
-                    if await self._validate_session():
-                        return
-        # 2. No session or invalid: login
+        """Log in with UPWORK_USERNAME / UPWORK_PASSWORD from .env."""
         ok = await self._do_login()
         if not ok:
             raise ScraperException("Login failed; check credentials or solve captcha")
-        await self._save_cookies(self.cookies_path)
 
     async def _wait_for_cloudflare(self):
         """Wait for human to solve or for challenge to pass."""

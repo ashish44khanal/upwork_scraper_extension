@@ -92,8 +92,7 @@ async def extract_dom(submission: DOMSubmission):
 async def scrape_upwork(request: UpworkScrapeRequest):
     """
     Scrape jobs from Upwork at the given product URL.
-    Uses persistent session (cookies.json); logs in only when needed.
-    Requires UPWORK_USERNAME/UPWORK_PASSWORD in env when login is required.
+    Logs in each run using UPWORK_USERNAME/UPWORK_PASSWORD from env.
     """
     try:
         scraper = UpworkScraper(headless=request.headless)

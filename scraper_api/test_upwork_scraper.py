@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-E2E test for Upwork scraper: product URL + session (login / cookies).
+E2E test for Upwork scraper: product URL + login each run.
 
 Run locally (browser + network required). Env vars are read from .env:
   python test_upwork_scraper.py
