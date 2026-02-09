@@ -1,12 +1,14 @@
 import sys
 import os
+from pathlib import Path
 
 # Add the project root to the python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Load environment variables from .env file
+# Load environment variables from .env file (scraper_api/.env)
 from dotenv import load_dotenv
-load_dotenv()
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=_env_path)
 
 from fastapi import FastAPI
 from src.api.v1.api import api_router

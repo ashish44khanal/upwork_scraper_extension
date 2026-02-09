@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException
+from typing import List, Any
 from fastapi.responses import Response
-from src.schemas.extraction import DOMSubmission, ExtractedData
+from src.schemas.extraction import DOMSubmission, ExtractedData, UpworkSearchRequest, UpworkScrapeRequest
 from src.services.gemini_extractor import GeminiExtractor
+from src.services.upwork_scraper import UpworkScraper
 import json
 import os
 from datetime import datetime
@@ -84,6 +86,39 @@ async def extract_dom(submission: DOMSubmission):
                 "message": "An unexpected error occurred during processing.",
                 "type": "UNKNOWN_ERROR"
             }
+        )
+
+@router.post("/upwork", response_model=List[ExtractedData])
+async def scrape_upwork(request: UpworkScrapeRequest):
+    """
+    Scrape jobs from Upwork at the given product URL across one or more pages.
+    no_of_pages_to_scrape: null = all pages; 1, 2, 3... = up to that many pages.
+    Logs in each run using UPWORK_USERNAME/UPWORK_PASSWORD from env.
+    """
+    try:
+        scraper = UpworkScraper(headless=request.headless)
+        results = await scraper.scrape_jobs(
+            product_url=request.product_url,
+            no_of_pages_to_scrape=request.no_of_pages_to_scrape,
+        )
+        await scraper.close()
+        
+        if not results:
+            raise HTTPException(
+                status_code=404,
+                detail="No jobs found or scraper was blocked by Cloudflare."
+            )
+            
+        return [ExtractedData(**job) for job in results]
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Upwork critical API error: {e}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Automation failure: {str(e)}"
         )
 
 def decompress_dom(compressed_b64: str) -> str:

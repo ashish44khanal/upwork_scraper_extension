@@ -1,7 +1,9 @@
 import google.generativeai as genai
 import json
 import os
+import asyncio
 from typing import Dict, Any
+from datetime import datetime
 
 class GeminiExtractor:
     """
@@ -15,7 +17,7 @@ class GeminiExtractor:
             raise ValueError("GEMINI_API_KEY environment variable not set")
         
         genai.configure(api_key=api_key)
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         
         # Configure generation with strict JSON output
         generation_config = {
@@ -66,7 +68,7 @@ EXTRACTION SCHEMA:
   "total_spent":"extract the total amount spent by client so far on the platform to hire people. for example $1.4K total spent",
   "avg_hourly_rate_paid":"extract avg hourly rate paid by client. For example $8.00 /hr",
   "total_paid_hours":" extract the total hours paid by client so far. For example 88 hours",
-  "client_account_active_date:"extract the client membership data on the platform. For example Member since Apr 15, 2024",
+  "client_account_active_date":"extract the client membership data on the platform. For example Member since Apr 15, 2024",
   "no_of_proposal_received":"extract the numbers of proposals sent for this job so far under activity on this job section. For example 50+",
   "no_of_invites_sent":"extract the numbers of invites sent for this job so far under activity on this job section",
   "talent_type":"extract the text for Talent_Type under Preferred qualifications section. For example: independent",
@@ -158,7 +160,8 @@ Return ONLY the JSON with extracted data. NO additional text or explanations."""
                 "list_of_skills_and_expertise_required_for_the_job": extracted_data.get("list_of_skills_and_expertise_required_for_the_job"),
                 "client_rating_info": extracted_data.get("client_rating_info"),
                 "other_open_jobs_by_client": extracted_data.get("other_open_jobs_by_client"),
-                "client_recent_history": extracted_data.get("client_recent_history")
+                "client_recent_history": extracted_data.get("client_recent_history"),
+                "scraped_at": datetime.now().isoformat()
             }
             
             return result
@@ -166,3 +169,11 @@ Return ONLY the JSON with extracted data. NO additional text or explanations."""
         except Exception as e:
             print(f"Gemini extraction error: {e}")
             raise
+    
+    async def extract_from_html_async(self, html: str) -> Dict[str, Any]:
+        """
+        Async wrapper for extract_from_html to enable concurrent processing.
+        Runs the synchronous Gemini API call in a thread pool.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.extract_from_html, html)
