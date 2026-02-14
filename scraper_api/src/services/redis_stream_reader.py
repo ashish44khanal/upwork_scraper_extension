@@ -4,24 +4,35 @@ import logging
 import os
 import redis
 import redis.asyncio as aioredis
-import base64
 from datetime import datetime
+
 from src.core.config import settings
+from src.core.browser import BrowserManager
+from src.services.session_manager import UpworkSessionManager
 from src.services.upwork_scraper import UpworkScraper
 
 logger = logging.getLogger(__name__)
 
 class RedisStreamReader:
+    """
+    Consumer for Redis streams. 
+    Coordinates between the Singleton Browser, Session Manager, and Scraper.
+    """
     def __init__(self):
         self.redis_client = None
-        # Manager for singleton browser lifecycle
-        self.manager_scraper = UpworkScraper(headless=False)
-        self.semaphore = asyncio.Semaphore(8) # Limit to 8 concurrent tabs
+        self.browser_manager = BrowserManager(headless=False)
+        self.session_manager = UpworkSessionManager(self.browser_manager)
+        
+        # Concurrency control
+        self.semaphore = asyncio.Semaphore(8)
+        
+        # Redis config
         self.stream_name = settings.REDIS_STREAM_NAME
         self.group_name = settings.REDIS_GROUP_NAME
         self.consumer_name = settings.REDIS_CONSUMER_NAME
 
     async def connect(self):
+        """Initializes Redis connection and consumer group."""
         try:
             self.redis_client = aioredis.Redis(
                 host=settings.REDIS_HOST,
@@ -30,139 +41,110 @@ class RedisStreamReader:
             )
             logger.info(f"Connected to Redis at {settings.REDIS_HOST}:{settings.REDIS_PORT}")
             
-            # Ensure scraper group exists
             try:
                 await self.redis_client.xgroup_create(self.stream_name, self.group_name, id="0", mkstream=True)
-                logger.info(f"Created consumer group {self.group_name} on stream {self.stream_name}")
+                logger.info(f"Created consumer group {self.group_name}")
             except redis.ResponseError as e:
-                if "BUSYGROUP" in str(e):
-                    logger.info(f"Consumer group {self.group_name} already exists")
-                else:
-                    raise e
+                if "BUSYGROUP" not in str(e): raise e
         except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            raise e
+            logger.error(f"Redis connection failure: {e}")
+            raise
 
-    async def _handle_card_data(self, card_index, page_num, raw_html, filtered_html, url, stream_id, extraction_mode):
-        """
-        Callback from scraper for each card:
-        1. Saves Filtered HTML.
-        2. Publishes event to extraction stream.
-        """
+    async def _on_card_data(self, **kwargs):
+        """Callback to handle extracted card HTML."""
         try:
+            stream_id = kwargs.get("stream_id")
+            page_num = kwargs.get("page_num")
+            card_index = kwargs.get("card_index")
+            filtered_html = kwargs.get("filtered_html")
+            
             filename_base = f"{stream_id}_p{page_num}_c{card_index}"
             os.makedirs(settings.STORAGE_DIR, exist_ok=True)
-            
             html_path = os.path.abspath(os.path.join(settings.STORAGE_DIR, f"{filename_base}.html"))
             
-            # Save Filtered HTML
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(filtered_html)
             
-            # Publish event
             event_data = {
                 "original_stream_id": stream_id,
                 "card_index": str(card_index),
                 "page_num": str(page_num),
                 "html_path": html_path,
-                "url": url,
-                "extraction_mode": extraction_mode,
+                "url": kwargs.get("url"),
+                "extraction_mode": kwargs.get("extraction_mode", "manual"),
                 "status": "card_captured",
                 "timestamp": datetime.now().isoformat()
             }
             
-            new_msg_id = await self.redis_client.xadd(
-                settings.EXTRACTION_STREAM_NAME, 
-                event_data
-            )
-            logger.info(f"Published card event {new_msg_id} for {stream_id} (Card {card_index})")
-            
+            await self.redis_client.xadd(settings.EXTRACTION_STREAM_NAME, event_data)
         except Exception as e:
-            logger.error(f"Error in card callback for {stream_id} card {card_index}: {e}")
+            logger.error(f"Card processing error: {e}")
 
     async def process_message(self, message_id, data):
-        """
-        Process a single message from the Redis stream with Semaphore isolation.
-        Each message runs in its own tab.
-        """
+        """Executes a scraping task for a single stream message."""
         async with self.semaphore:
-            logger.info(f"🚀 Starting background process for {message_id} (active: {8 - self.semaphore._value})")
+            logger.info(f"🚀 Processing task {message_id}")
             
-            page_url = data.get("page_url")
-            if not page_url:
-                logger.warning(f"No page_url found in message {message_id}")
-                return
+            url = data.get("page_url")
+            pages = int(data.get("pages", settings.DEFAULT_SCRAPE_PAGES))
+            mode = data.get("extraction_mode", "manual")
 
-            extraction_mode = data.get("extraction_mode", "manual")
-            pages_to_scrape = int(data.get("pages", settings.DEFAULT_SCRAPE_PAGES))
-
-            # Isolated scraper for this specific task
-            task_scraper = UpworkScraper(headless=False)
+            scraper = UpworkScraper(self.browser_manager, self.session_manager)
             
             try:
-                async def card_callback(**kwargs):
-                    await self._handle_card_data(
+                async def callback(**kwargs):
+                    await self._on_card_data(
                         stream_id=message_id, 
-                        extraction_mode=extraction_mode, 
+                        extraction_mode=mode, 
                         **kwargs
                     )
 
-                await task_scraper.scrape_jobs(
-                    product_url=page_url,
-                    no_of_pages_to_scrape=pages_to_scrape,
-                    on_card_data_async=card_callback
+                await scraper.scrape_jobs(
+                    product_url=url,
+                    no_of_pages_to_scrape=pages,
+                    on_card_data_async=callback
                 )
                 
-                # Acknowledge the original message
                 await self.redis_client.xack(self.stream_name, self.group_name, message_id)
-                logger.info(f"✅ Finished and Acknowledged message {message_id}")
-                
+                logger.info(f"✅ Completed task {message_id}")
             except Exception as e:
-                logger.error(f"❌ Error processing search request {message_id}: {e}")
-            finally:
-                # Close only this specific tab
-                await task_scraper.close()
+                logger.error(f"❌ Task {message_id} failed: {e}")
 
     async def run(self):
+        """Main loop: listens for new messages in the stream."""
         await self.connect()
-        logger.info(f"Starting Redis stream reader on stream: {self.stream_name}")
         
-        # Warmup: Ensure singleton session is ready before processing streams
-        logger.info("🛠️  Preparing Elite Scraper environment...")
-        await self.manager_scraper.verify_session()
-        
+        # Browser Warmup
+        logger.info("🛠️  Warming up persistent session...")
+        temp_tab = await self.browser_manager.create_tab()
+        try:
+            await self.session_manager.verify_or_login(temp_tab)
+        finally:
+            await temp_tab.close()
+            
         try:
             while True:
-                try:
-                    messages = await self.redis_client.xreadgroup(
-                        groupname=self.group_name,
-                        consumername=self.consumer_name,
-                        streams={self.stream_name: ">"},
-                        count=1,
-                        block=5000
-                    )
-                    
-                    if not messages:
-                        continue
-                        
-                    for stream, msgs in messages:
-                        for message_id, data in msgs:
-                            # Dispatch task asynchronously
-                            asyncio.create_task(self.process_message(message_id, data))
-                except Exception as e:
-                    logger.error(f"Error reading from stream: {e}")
-                    await asyncio.sleep(5)
-                    
+                messages = await self.redis_client.xreadgroup(
+                    groupname=self.group_name,
+                    consumername=self.consumer_name,
+                    streams={self.stream_name: ">"},
+                    count=1,
+                    block=5000
+                )
+                if not messages: continue
+                
+                for stream, msgs in messages:
+                    for message_id, data in msgs:
+                        asyncio.create_task(self.process_message(message_id, data))
         finally:
-            if self.redis_client:
-                await self.redis_client.close()
-            # Final browser shutdown
-            await UpworkScraper.shutdown()
+            await self.browser_manager.close_all()
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    reader = RedisStreamReader()
-    await reader.run()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    )
+    await RedisStreamReader().run()
 
 if __name__ == "__main__":
     asyncio.run(main())

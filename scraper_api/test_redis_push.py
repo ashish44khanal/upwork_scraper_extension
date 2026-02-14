@@ -54,7 +54,6 @@ async def test_redis_pipeline():
                             print(f"✅ Card Found! Event {ext_id}")
                             print(f"   - Card Index: {ext_data.get('card_index')}")
                             print(f"   - HTML: {ext_data.get('html_path')}")
-                            print(f"   - Screenshot: {ext_data.get('screenshot_path')}")
             
             if cards_found > 0:
                 # We could break if we know how many cards to expect, but let's just wait a bit

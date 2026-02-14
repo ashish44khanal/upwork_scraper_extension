@@ -4,6 +4,8 @@ from fastapi.responses import Response
 from src.schemas.extraction import DOMSubmission, ExtractedData, UpworkSearchRequest, UpworkScrapeRequest
 from src.services.gemini_extractor import GeminiExtractor
 from src.services.upwork_scraper import UpworkScraper
+from src.core.browser import BrowserManager
+from src.services.session_manager import UpworkSessionManager
 import json
 import os
 from datetime import datetime
@@ -96,20 +98,39 @@ async def scrape_upwork(request: UpworkScrapeRequest):
     Logs in each run using UPWORK_USERNAME/UPWORK_PASSWORD from env.
     """
     try:
-        scraper = UpworkScraper(headless=request.headless)
-        results = await scraper.scrape_jobs(
+        browser_manager = BrowserManager(headless=request.headless)
+        session_manager = UpworkSessionManager(browser_manager)
+        scraper = UpworkScraper(browser_manager, session_manager)
+        
+        # Note: In the refactored scraper, results are typically handled via callbacks
+        # For this direct API endpoint, we'll collect them in a list
+        all_results = []
+        async def sync_callback(**kwargs):
+            # This handles the card extraction logic normally done by RedisStreamReader
+            # For simplicity in this direct endpoint, we return the filtered_html
+            # although usually the endpoint would trigger a full extraction later.
+            all_results.append(kwargs.get("filtered_html"))
+
+        await scraper.scrape_jobs(
             product_url=request.product_url,
             no_of_pages_to_scrape=request.no_of_pages_to_scrape,
+            on_card_data_async=sync_callback
         )
-        await scraper.close()
         
-        if not results:
+        if not all_results:
             raise HTTPException(
                 status_code=404,
-                detail="No jobs found or scraper was blocked by Cloudflare."
+                detail="No jobs found or scraper was blocked."
             )
             
-        return [ExtractedData(**job) for job in results]
+        # For the direct API, we might want to run Gemini extraction immediately 
+        # on the collected HTML chunks if the request expects ExtractedData
+        final_data = []
+        for html in all_results:
+            extracted = extractor.extract_from_html(html)
+            final_data.append(ExtractedData(**extracted))
+            
+        return final_data
     except HTTPException:
         raise
     except Exception as e:
