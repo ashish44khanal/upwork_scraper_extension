@@ -65,16 +65,20 @@ LOGIN_URL = "https://www.upwork.com/ab/account-security/login"
 class UpworkScraper:
     """
     Elite Stealth Scraper using Nodriver (CDP-based).
-    Logs in on each run using UPWORK_USERNAME and UPWORK_PASSWORD from .env.
+    Supports persistent singleton browser and tab-based concurrency.
     """
+    # Shared singleton browser and locks for concurrency
+    _browser = None
+    _browser_lock = asyncio.Lock()
+    _login_lock = asyncio.Lock()
     
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = False, page=None):
         self.headless = headless
-        self.extractor = GeminiExtractor()
+        self.page = page
         self.browser = None
-        self.page = None
+        self.extractor = GeminiExtractor()
         self.output_file = "upwork.json"
-        self.profile_path = os.path.join(os.getcwd(), 'upwork_profile_nd')
+        self.profile_path = os.path.abspath(os.path.join(os.getcwd(), 'upwork_profile_nd'))
         self.login_url = LOGIN_URL
         self.debug_save = True
         self.session_id = str(uuid.uuid4())[:8]  # Unique session identifier
@@ -87,22 +91,93 @@ class UpworkScraper:
         }
 
     async def _init_browser(self):
-        if not self.browser:
-            logger.info("Launching Elite Nodriver Browser...")
-            # sandbox=False adds --no-sandbox so Chrome can connect (root / restricted envs).
-            # Nodriver param is "sandbox" (True=default); we pass sandbox=False to disable.
-            use_sandbox = os.getenv("NODRIVER_SANDBOX", "").lower() in ("1", "true", "yes")
-            if not use_sandbox and getattr(os, "geteuid", lambda: -1)() == 0:
-                logger.info("Running as root: disabling sandbox")
-            self.browser = await uc.start(
-                headless=self.headless,
-                user_data_dir=self.profile_path,
-                browser_args=["--start-maximized"],
-                sandbox=use_sandbox,  # False => --no-sandbox (fixes "Failed to connect to browser")
-            )
-            # Entry point maturation
-            self.page = await self.browser.get("https://www.google.com/search?q=upwork+jobs")
-            await asyncio.sleep(3)
+        """
+        Singleton browser manager: ensures only one browser instance runs with the user profile.
+        """
+        async with UpworkScraper._browser_lock:
+            # Check if browser exists and is still responsive
+            is_alive = False
+            if UpworkScraper._browser:
+                try:
+                    # Simple health check: ping the browser
+                    await UpworkScraper._browser.connection.send(cdp.browser.get_version())
+                    is_alive = True
+                except Exception:
+                    logger.warning("Singleton browser appears dead. Resetting...")
+                    UpworkScraper._browser = None
+
+            if not UpworkScraper._browser:
+                logger.info("Initializing Singleton Elite Nodriver Browser...")
+                browser_args = ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+                
+                max_retries = 2
+                for attempt in range(max_retries + 1):
+                    try:
+                        UpworkScraper._browser = await uc.start(
+                            headless=self.headless,
+                            user_data_dir=self.profile_path,
+                            browser_args=browser_args,
+                            sandbox=False,
+                        )
+                        is_alive = True
+                        break
+                    except Exception as e:
+                        if attempt < max_retries:
+                            logger.warning(f"Browser launch attempt {attempt+1} failed: {e}. Cleaning and retrying...")
+                            # Aggressively kill processes and remove locks
+                            if os.name == 'posix':
+                                os.system('pkill -f "Google Chrome" || true')
+                                os.system('pkill -f "chrome" || true')
+                                # CRITICAL: Remove the singleton lock file which prevents re-entry
+                                lock_file = os.path.join(self.profile_path, 'SingletonLock')
+                                if os.path.exists(lock_file):
+                                    try: os.remove(lock_file)
+                                    except: pass
+                            await asyncio.sleep(2)
+                        else:
+                            logger.error(f"Failed to launch singleton browser after {max_retries+1} attempts.")
+                            raise e
+            
+            self.browser = UpworkScraper._browser
+            
+            # If this task instance doesn't have a page or it's closed, use a new tab
+            if not self.page:
+                logger.debug(f"[Session: {self.session_id}] Creating new tab for task")
+                self.page = await self.browser.get("about:blank", new_tab=True)
+                # Small wait for tab stability
+                await asyncio.sleep(1)
+
+    async def scrape_and_save_raw(self, url: str, filename_base: str, storage_dir: str) -> Dict[str, str]:
+        """
+        Elite navigation and capture: Saves HTML and Screenshot for downstream extraction.
+        """
+        await self._init_browser()
+        await self._ensure_session()
+        
+        logger.info(f"Navigating to for raw capture: {url}")
+        await self.page.get(url)
+        await self._wait_for_cloudflare()
+        
+        # Wait for hydration/rendering
+        await asyncio.sleep(random.uniform(3.0, 5.0))
+        
+        os.makedirs(storage_dir, exist_ok=True)
+        
+        html_path = os.path.abspath(os.path.join(storage_dir, f"{filename_base}.html"))
+        
+        # 1. Capture and Save HTML
+        content = await self.page.get_content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            
+        logger.info(f"✅ Raw capture complete for {filename_base}")
+        logger.info(f"HTML: {html_path}")
+        
+        return {
+            "html_path": html_path,
+            "url": url,
+            "timestamp": datetime.now().isoformat()
+        }
 
     async def _human_delay(self, min_sec: float = 0.3, max_sec: float = 0.8):
         """Random delay to mimic human; reduces antibot detection."""
@@ -234,6 +309,20 @@ class UpworkScraper:
             await self._human_type(pw, password)
             await self._human_delay(0.4, 0.9)
 
+            # 3.5 Remember Me checkbox
+            try:
+                # Upwork usually has 'Remember me' on the password step
+                remember_sel = ['#login_rememberme', 'input[name="login[remember_me]"]', 'label[for="login_rememberme"]']
+                for rsel in remember_sel:
+                    try:
+                        rem = await self.page.select(rsel, timeout=1)
+                        if rem:
+                            await rem.click()
+                            logger.info("Login: Selected 'Remember me'")
+                            break
+                    except: continue
+            except: pass
+
             # 4. Log in button
             login_btn = await self._select_login_submit(timeout=8)
             if not login_btn:
@@ -245,19 +334,80 @@ class UpworkScraper:
                 pass
             await self._human_delay(0.2, 0.6)
             await login_btn.click()
-            await asyncio.sleep(random.uniform(3.0, 4.5))
-            await self._wait_for_cloudflare()
-
-            # Check we left login page
-            login_input_after = await self._select_login_username(timeout=2)
-            if login_input_after:
-                logger.warning("Login: still on login page (wrong credentials or captcha)")
-                return False
-            logger.info("Login succeeded")
+            # Mandatory wait to ensure cookies are flushed to disk
+            logger.info("✨ Login successful. Syncing session to disk...")
+            await asyncio.sleep(5)
+            
             return True
         except Exception as e:
             logger.error(f"Login failed: {e}")
         return False
+
+    async def verify_session(self) -> bool:
+        """
+        Elite Multi-Layer Session Verification.
+        Strategy:
+        1. Query CDP for active session cookies (oauth/token).
+        2. Navigate to dashboard and check for private UI components.
+        3. Logic fallbacks for different account states (Freelancer/Client).
+        """
+        await self._init_browser()
+        
+        # Layer 1: Passive Cookie Check (No navigation required)
+        try:
+            cookies = await self.page.send(cdp.network.get_cookies())
+            authorized = any(c.name in ["oauth_token", "login_remember_me"] for c in cookies)
+            if authorized:
+                logger.debug("� CDP: Found cryptographic session tokens in local storage.")
+        except Exception:
+            authorized = False
+
+        # Layer 2: Active Navigation Check
+        try:
+            logger.info("🔍 Conducting deep-layer session verification...")
+            await self.page.get("https://www.upwork.com/nx/find-work/")
+            await self._wait_for_cloudflare()
+            await asyncio.sleep(4) # Allow JS hydration
+            
+            current_url = self.page.url
+            
+            # Absolute failure case: Redirected to login
+            if "upwork.com/ab/account-security/login" in current_url:
+                logger.info("� Secure session expired or missing. Initializing recovery flow...")
+                success = await self._do_login()
+                if success:
+                    logger.info("✨ Recovery successful. New session context synced to profile.")
+                    await asyncio.sleep(5)
+                    return True
+                return False
+
+            # Success indicators (Freelancer or Client variants)
+            logged_in_indicators = [
+                'button[data-test="nav-user-menu"]',      # Avatar Menu
+                '.air3-avatar',                           # User Avatar
+                'a[href="/nx/find-work/"]',              # Find Work link
+                '.up-n-nav-job-search'                    # Search input
+            ]
+            
+            for selector in logged_in_indicators:
+                try:
+                    el = await self.page.select(selector, timeout=3)
+                    if el:
+                        logger.info(f"✨ Session verified via component: {selector}")
+                        return True
+                except: continue
+
+            # Fallback URL logic
+            if any(path in current_url for path in ["nx/find-work", "nx/search/jobs", "freelancers/settings"]):
+                logger.info("✨ Professional session confirmed via target URL presence.")
+                return True
+                
+            logger.warning(f"⚠️ Session identity ambiguous (URL: {current_url}). Attempting deep re-login...")
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Session verification interrupted: {e}")
+            return False
 
     async def _ensure_session(self) -> None:
         """Log in with UPWORK_USERNAME / UPWORK_PASSWORD from .env."""
@@ -537,14 +687,15 @@ class UpworkScraper:
         print("❌ Failed to capture full DOM after retries.")
         return None
 
-    async def scrape_jobs(self, product_url: str, no_of_pages_to_scrape: Optional[int] = None) -> List[Dict[str, Any]]:
+
+    async def scrape_jobs(self, product_url: str, no_of_pages_to_scrape: Optional[int] = None, on_card_data_async=None) -> List[Dict[str, Any]]:
         """Scrape jobs from the given product URL across one or more pages. no_of_pages_to_scrape: None = all pages; 1,2,3... = up to that many pages."""
         try:
             try:
                 loop = asyncio.get_running_loop()
-                return await self._scrape_jobs_from_url(product_url, no_of_pages_to_scrape)
+                return await self._scrape_jobs_from_url(product_url, no_of_pages_to_scrape, on_card_data_async)
             except RuntimeError:
-                return asyncio.run(self._scrape_jobs_from_url(product_url, no_of_pages_to_scrape))
+                return asyncio.run(self._scrape_jobs_from_url(product_url, no_of_pages_to_scrape, on_card_data_async))
         except Exception as e:
             import traceback
             logger.error(f"Scrape failed: {e}")
@@ -556,9 +707,27 @@ class UpworkScraper:
         search_url = f"https://www.upwork.com/nx/search/jobs/?q={query.replace(' ', '%20')}"
         return await self.scrape_jobs(search_url, no_of_pages_to_scrape=no_of_pages_to_scrape)
 
-    async def _scrape_jobs_from_url(self, product_url: str, no_of_pages_to_scrape: Optional[int] = None) -> List[Dict[str, Any]]:
+    async def _scrape_jobs_from_url(self, product_url: str, no_of_pages_to_scrape: Optional[int] = None, on_card_data_async=None) -> List[Dict[str, Any]]:
         await self._init_browser()
-        await self._ensure_session()
+        
+        # Premium Session Logic: Check if we need to login
+        # We check specific URL first
+        await self.page.get(product_url)
+        await self._wait_for_cloudflare()
+        
+        if "upwork.com/ab/account-security/login" in self.page.url:
+            logger.info("🔒 Navigation intercepted by login wall. Recovering session...")
+            async with UpworkScraper._login_lock:
+                # Double check inside lock
+                if "upwork.com/ab/account-security/login" in self.page.url:
+                    success = await self._do_login()
+                    if not success:
+                        raise ScraperException("Unable to breach the login wall. Check credentials/CAPTCHA.")
+                    # Re-navigate to the target
+                    await self.page.get(product_url)
+                    await self._wait_for_cloudflare()
+        else:
+            logger.debug("🚀 Session active. Rocketing to target URL...")
 
         # Queue for GraphQL userJobSearch response request_id (handler runs in same tab)
         graphql_queue: asyncio.Queue = asyncio.Queue()
@@ -642,17 +811,26 @@ class UpworkScraper:
                         # Detect frame/context
                         context = await self._find_job_frame()
                         
-                        # Extract WHOLE PAGE HTML
+                        # 1. Capture WHOLE PAGE HTML
                         full_page_dom = await self._extract_job_modal(context=context)
-                        
+
                         if full_page_dom:
                             # Clean and Filter HTML on the SERVER side
                             logger.debug(f"[Session: {self.session_id}] Filtering HTML for card {card_index}")
                             filtered_html = self._clean_html_server_side(full_page_dom)
                             
+                            if on_card_data_async:
+                                await on_card_data_async(
+                                    card_index=card_index,
+                                    page_num=page_num,
+                                    raw_html=full_page_dom,
+                                    filtered_html=filtered_html,
+                                    url=self.page.url
+                                )
+                            
                             if filtered_html:
                                 temp_html_list.append({f"card_{card_index}": filtered_html})
-                                logger.info(f"[Session: {self.session_id}] ✅ Card {card_index} stored ({len(filtered_html)} chars)")
+                                logger.info(f"[Session: {self.session_id}] ✅ Card {card_index} processed")
                             else:
                                 logger.warning(f"[Session: {self.session_id}] Server-side filter failed for card {card_index}")
                         else:
@@ -697,57 +875,12 @@ class UpworkScraper:
             logger.error(f"Global extraction failure: {e}")
             print(f"[CONSOLE] CRITICAL FAILURE: {e}")
 
-        # 3. Post-Process with Concurrent Gemini AI Extraction
-        print("\n" + "="*50)
-        logger.info(f"[Session: {self.session_id}] Starting concurrent AI extraction for {len(temp_html_list)} cards")
+        return []
         
-        ai_start_time = time.time()
-        response_content = []
-        failed_extractions = []
         
-        # Create concurrent extraction tasks
-        async def extract_single_card(item: Dict[str, str], index: int) -> Optional[Dict[str, Any]]:
-            """Extract data from a single card with error handling"""
-            card_key = list(item.keys())[0]
-            html_content = item[card_key]
-            
-            if not html_content:
-                logger.warning(f"[Session: {self.session_id}] Empty HTML for {card_key}")
-                return None
-                
-            try:
-                logger.debug(f"[Session: {self.session_id}] Extracting data for {card_key}...")
-                data = await self.extractor.extract_from_html_async(html_content)
-                if data:
-                    logger.info(f"[Session: {self.session_id}] ✅ AI Extraction SUCCESS for {card_key}")
-                    self.consecutive_failures = 0  # Reset failure counter
-                    return data
-                else:
-                    logger.warning(f"[Session: {self.session_id}] AI returned empty data for {card_key}")
-                    return None
-            except Exception as e:
-                logger.error(f"[Session: {self.session_id}] ❌ AI Extraction FAILED for {card_key}: {e}")
-                self.consecutive_failures += 1
-                failed_extractions.append(index + 1)
-                return None
         
-        # Execute all extractions concurrently
-        extraction_tasks = [
-            extract_single_card(item, i) 
-            for i, item in enumerate(temp_html_list)
-        ]
         
-        results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
         
-        # Filter out None and exceptions
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"[Session: {self.session_id}] Exception in extraction {i+1}: {result}")
-                failed_extractions.append(i + 1)
-            elif result is not None:
-                response_content.append(result)
-        
-        ai_extraction_time = time.time() - ai_start_time
         self.performance_metrics['ai_extraction_time'] = ai_extraction_time
         
         # Log performance metrics
@@ -768,11 +901,30 @@ class UpworkScraper:
         return response_content
 
     async def close(self):
+        """
+        Cleanup the specific tab/page. The singleton browser remains open.
+        """
         try:
-            if self.browser:
-                logger.info("Decommissioning browser...")
-                await self.browser.stop()
-        except: pass
+            if self.page:
+                logger.info(f"[Session: {self.session_id}] Closing tab...")
+                await self.page.close()
+        except Exception as e:
+            logger.debug(f"Error closing tab: {e}")
+        finally:
+            self.page = None
+
+    @classmethod
+    async def shutdown(cls):
+        """
+        Final shutdown of the singleton browser instance.
+        """
+        async with cls._browser_lock:
+            if cls._browser:
+                logger.info("Shutting down Singleton Browser...")
+                try:
+                    await cls._browser.stop()
+                except: pass
+                cls._browser = None
 
 if __name__ == "__main__":
     scraper = UpworkScraper(headless=False)

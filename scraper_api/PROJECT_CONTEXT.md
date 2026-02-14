@@ -6,9 +6,10 @@ Use this document as reference for future work on the Upwork scraper (prompts, o
 
 ## 1. Overview
 
-- **Purpose**: Scrape job listings from Upwork search/product URLs: login, navigate to a search page, open each job tile, extract modal HTML, and run Gemini to get structured job data.
-- **Stack**: Python (FastAPI), [Nodriver](https://github.com/ultrafunkamsterdam/nodriver) (CDP-based browser automation), Gemini for extraction.
-- **Session**: **No cookie/session persistence**. Login is performed on every run using env credentials.
+- **Purpose**: Scrape job listings from Upwork search/product URLs: login (once), navigate to search pages, open job tiles, extract modal HTML, and run Gemini for structured data.
+- **Stack**: Python (FastAPI), [Nodriver](https://github.com/ultrafunkamsterdam/nodriver) (CDP-based automation), Redis (Streams) for async processing, Gemini.
+- **Session**: **Persistent Chromium Profile**. Sessions are stored in `upwork_profile_nd/` and reused across restarts. Includes "Remember Me" checkbox support.
+- **Concurrency**: **Multi-tab Processing**. A singleton browser instance handles up to 8 concurrent scraping tabs using `asyncio.Semaphore`.
 
 ---
 
@@ -27,15 +28,18 @@ Use this document as reference for future work on the Upwork scraper (prompts, o
 ## 3. Login Flow (No Cookies)
 
 - **URL**: `https://www.upwork.com/ab/account-security/login`
-- **Steps**:
-  1. Navigate to login URL.
-  2. **Username**: Clear input with `clear_input()`, then type via `_human_type()` into `#login_username` (fallbacks: `input[name='login[username]']`, etc.).
-  3. Click **Continue**: `#login_password_continue` (or `button[data-ev-label="Continue"][target-form="username"]`).
-  4. **Password**: Clear input, then `_human_type()` into `#login_password`.
-  5. Click **Log in**: `#login_control_continue`.
-  6. Wait for redirect / login form to disappear.
-- **Humanization**: `_human_delay()` between actions; `_human_type()` types at ~40–60 WPM (delays per key, longer for `@` and `.`). Inputs are cleared before typing.
-- **Session**: Cookie-based persistence was removed by design; each run does a full login.
+- **Persistence Strategy**:
+  1. **Singleton Browser**: Only one browser instance runs, initialized with an absolute `user_data_dir`.
+  2. **Verify Session**: Before any task, `verify_session()` checks CDP cookies and UI indicators (e.g., user avatar).
+  3. **Auto-Recovery**: If no session is found, `_do_login()` is triggered over the persistent profile.
+- **Login Steps**:
+  1. Username entered into `#login_username` via `_human_type()`.
+  2. Click **Continue**.
+  3. Password entered into `#login_password`.
+  4. **Remember Me**: The scraper explicitly clicks the "Remember Me" checkbox to ensure long-term persistence.
+  5. Click **Log in**.
+  6. **Persistence Sync**: Wait 5 seconds after login to ensure Chromium flushes all cookies/tokens to disk.
+- **Humanization**: `_human_delay()` between actions; typing at ~40–60 WPM.
 
 ---
 
@@ -55,16 +59,16 @@ Use this document as reference for future work on the Upwork scraper (prompts, o
 
 ## 5. Scraper Flow (High Level)
 
-1. **Init browser**: `_init_browser()` – Nodriver `uc.start()` with `user_data_dir`, `browser_args`. Optional `sandbox=False` when `NODRIVER_SANDBOX` is not set and e.g. running as root (fixes “Failed to connect to browser”).
-2. **Session**: `_ensure_session()` – always calls `_do_login()` (no cookie load/validate).
-3. **Navigate**: Go to `product_url`; handle Cloudflare if needed (`_wait_for_cloudflare()`).
-4. **Total pages**: Try GraphQL paging (`_get_total_pages_after_navigate` + handler); on failure use `_get_pagination_from_dom()`. Compute `pages_to_scrape = min(no_of_pages_to_scrape, total_pages)` or all pages if `no_of_pages_to_scrape` is `None`. If `no_of_pages_to_scrape <= 0`, return `[]`.
-5. **Per page** (1 to `pages_to_scrape`):
-   - If page > 1: navigate to `_build_next_page_url(product_url, page_num)`.
-   - Wait for tiles: `article.job-tile[data-test="JobTile"]` via `_wait_for_tiles()`.
-   - For each tile: click → wait for slider `div.air3-slider-content[data-test="UpCSliderBody"]` → `_extract_job_modal()` (full page DOM) → `_clean_html_server_side()` → append to list.
-   - Close modal and continue to next tile.
-6. **Extract**: Run Gemini extractor on collected HTML list; return `List[Dict]` → API returns `List[ExtractedData]`.
+1. **Init Browser**: `_init_browser()` – Manages a Singleton browser. If the instance is dead, it cleans up `SingletonLock` and zombie processes before restarting.
+2. **Session Warmup**: `verify_session()` – Passive cookie check via CDP followed by active navigation check for authenticated components.
+3. **Navigate**: Go to `product_url`. If a login wall is hit, it automatically triggers `_do_login()` and resumes.
+4. **Multi-Tab Execution**: `RedisStreamReader` dispatches messages to isolated scraper instances (tabs), limited by a concurrency semaphore of 8.
+5. **Per Page**:
+   - Navigate to current page.
+   - Wait for tiles: `article.job-tile[data-test="JobTile"]`.
+   - For each tile: click → wait for slider `.air3-slider-content` → `_extract_job_modal()` (full page DOM) → `_clean_html_server_side()`.
+6. **Efficiency**: **No Screenshots**. Screenshot logic was removed to optimize processing time and reduce storage costs.
+7. **Callback**: Card data is passed back to `RedisStreamReader` for publishing to the extraction stream and saving HTML to `storage/`.
 
 ---
 
@@ -72,11 +76,11 @@ Use this document as reference for future work on the Upwork scraper (prompts, o
 
 | Path | Role |
 |------|------|
-| `src/schemas/extraction.py` | `UpworkScrapeRequest`, `ExtractedData`, etc. |
-| `src/api/v1/endpoints/scrape.py` | `POST /upwork`, `POST /extract`, download; calls `scraper.scrape_jobs(product_url, no_of_pages_to_scrape)`. |
-| `src/services/upwork_scraper.py` | `UpworkScraper`: browser init, login, pagination (API + DOM), page loop, tile loop, modal extraction, Gemini. |
-| `src/services/gemini_extractor.py` | Gemini-based HTML → structured job data. |
-| `test_upwork_scraper.py` | E2E test: load `.env`, `scrape_jobs(product_url, no_of_pages_to_scrape=1)`. |
+| `app.py` | Main root-level entry point for the application. |
+| `src/services/upwork_scraper.py` | Singleton browser manager, multi-layered session verification, and job scraping logic (Modal/DOM). |
+| `src/services/redis_stream_reader.py` | Concurrent stream consumer with Semaphore-based tab isolation. |
+| `src/services/gemini_extractor.py` | LLM-based HTML to structured job data extraction. |
+| `test_redis_push.py` | Local utility to push tasks into the Redis stream for testing. |
 
 ---
 
@@ -101,11 +105,12 @@ Use these for browser start options, CDP (e.g. `cdp.network`), Tab/Element APIs,
 
 ## 9. Design Decisions (Summary)
 
-- **No `num_jobs`**: Replaced by `no_of_pages_to_scrape` (page-based).
-- **No cookie/session persistence**: Removed; login every run.
-- **Inputs cleared before typing**: `clear_input()` then human-like typing.
-- **Pagination**: Prefer GraphQL `userJobSearch` paging; fallback DOM “X of Y” + next link/URL.
-- **Browser sandbox**: Disabled when needed (e.g. root/Docker) unless `NODRIVER_SANDBOX` is set.
+- **Persistent Browser Profile**: Used for single-login lifecycle.
+- **Concurrency**: Tab-based isolation capped at 8 tabs per browser instance.
+- **Resource Cleanup**: Automated killing of zombie Chrome processes and removal of `SingletonLock` files.
+- **No Screenshots**: Removed to maximize scraping speed and reduce storage footprint.
+- **Root Entry Point**: `app.py` at root for simplified deployment and execution.
+- **Verification Fallbacks**: Multi-path login detection (Avatar, URL, Search bar).
 
 ---
 

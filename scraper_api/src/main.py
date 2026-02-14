@@ -13,10 +13,23 @@ load_dotenv(dotenv_path=_env_path)
 from fastapi import FastAPI
 from src.api.v1.api import api_router
 from src.core.config import settings
+import asyncio
+from contextlib import asynccontextmanager
+from src.services.redis_stream_reader import RedisStreamReader
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start the Redis Stream Reader in the background
+    reader = RedisStreamReader()
+    task = asyncio.create_task(reader.run())
+    yield
+    # Cleanup (optional, depend on how run() is implemented)
+    # task.cancel()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan
 )
 
 app.include_router(api_router, prefix=settings.API_V1_STR)

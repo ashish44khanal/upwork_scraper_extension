@@ -29,15 +29,18 @@ venv/
 ENV/
 
 # Scraper Specific
-upwork_profile/
-upwork_profile_nd/
+storage/
+upwork_profile*/
 cookies.json
 *.log
 upwork.json
 scraped_jobs.json
-no_results.png
-ui_missing_critical.png
-ui_missing_after_solve.png
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.html
+*.pdf
 
 # IDEs
 .vscode/
