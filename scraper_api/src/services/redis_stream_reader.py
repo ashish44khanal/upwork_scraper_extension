@@ -8,7 +8,8 @@ from datetime import datetime
 
 from src.core.config import settings
 from src.core.browser import BrowserManager
-from src.services.session_manager import UpworkSessionManager
+from src.core.database import AsyncSessionLocal
+from src.models.job_card import JobCard
 from src.services.upwork_scraper import UpworkScraper
 
 logger = logging.getLogger(__name__)
@@ -17,11 +18,11 @@ class RedisStreamReader:
     """
     Consumer for Redis streams. 
     Coordinates between the Singleton Browser, Session Manager, and Scraper.
+    Saves results to Postgres and propagates events.
     """
     def __init__(self):
         self.redis_client = None
         self.browser_manager = BrowserManager(headless=False)
-        self.session_manager = UpworkSessionManager(self.browser_manager)
         
         # Concurrency control
         self.semaphore = asyncio.Semaphore(8)
@@ -51,45 +52,96 @@ class RedisStreamReader:
             raise
 
     async def _on_card_data(self, **kwargs):
-        """Callback to handle extracted card HTML."""
+        """Callback to handle extracted card HTML and save to Postgres."""
         try:
-            stream_id = kwargs.get("stream_id")
+            stream_id = kwargs.get("stream_id") # e.g., 1771075644552-0
             page_num = kwargs.get("page_num")
             card_index = kwargs.get("card_index")
             filtered_html = kwargs.get("filtered_html")
+            url = kwargs.get("url")
+            extraction_mode = kwargs.get("extraction_mode", "manual")
             
-            filename_base = f"{stream_id}_p{page_num}_c{card_index}"
-            os.makedirs(settings.STORAGE_DIR, exist_ok=True)
-            html_path = os.path.abspath(os.path.join(settings.STORAGE_DIR, f"{filename_base}.html"))
+            # 1. Construct Predictable ID
+            # Redis stream IDs are timestamp-sequence (e.g., 1771075644552-0)
+            # We create a sequence for this card to avoid collisions within the same task.
+            base_ms = stream_id.split("-")[0]
+            # Redis IDs must be milliseconds-sequence. Page/Card combined into sequence.
+            # Using (page * 100) + index ensures uniqueness for up to 100 cards/page.
+            sequence = (int(page_num) * 100) + int(card_index)
+            predictable_id = f"{base_ms}-{sequence}"
             
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(filtered_html)
+            # 2. Save to Postgres first
+            async with AsyncSessionLocal() as session:
+                new_card = JobCard(
+                    event_id=predictable_id,  # Use predictable ID for lookup
+                    url=url,
+                    status="captured",
+                    html_content=filtered_html,
+                    metadata_json={
+                        "original_task_id": stream_id,
+                        "page_num": page_num,
+                        "card_index": card_index,
+                        "extraction_mode": extraction_mode
+                    }
+                )
+                session.add(new_card)
+                await session.commit()
+                await session.refresh(new_card)
+                card_db_id = new_card.id
             
+            logger.info(f"✅ Saved card {card_index} to DB with predictable ID: {predictable_id}")
+
+            # 3. Publish event to extraction stream with the EXACT same ID
             event_data = {
+                "event_id": predictable_id,
+                "card_db_id": str(card_db_id),
                 "original_stream_id": stream_id,
                 "card_index": str(card_index),
                 "page_num": str(page_num),
-                "html_path": html_path,
-                "url": kwargs.get("url"),
-                "extraction_mode": kwargs.get("extraction_mode", "manual"),
+                "url": url,
+                "extraction_mode": extraction_mode,
                 "status": "card_captured",
                 "timestamp": datetime.now().isoformat()
             }
             
-            await self.redis_client.xadd(settings.EXTRACTION_STREAM_NAME, event_data)
+            # Try with predictable ID first, fallback to '*' if it fails (e.g. ID already exists)
+            try:
+                msg_id = await self.redis_client.xadd(
+                    settings.EXTRACTION_STREAM_NAME, 
+                    event_data,
+                    id=predictable_id
+                )
+            except redis.ResponseError as re:
+                if "equal or smaller" in str(re):
+                    logger.warning(f"⚠️ ID collision for {predictable_id}, falling back to auto-increment")
+                    msg_id = await self.redis_client.xadd(
+                        settings.EXTRACTION_STREAM_NAME, 
+                        event_data,
+                        id="*"
+                    )
+                else:
+                    raise re
+            
+            logger.info(f"📤 Published extraction event: {msg_id}")
+
         except Exception as e:
-            logger.error(f"Card processing error: {e}")
+            logger.error(f"Card processing or DB saving error: {e}")
 
     async def process_message(self, message_id, data):
         """Executes a scraping task for a single stream message."""
         async with self.semaphore:
             logger.info(f"🚀 Processing task {message_id}")
+            logger.info(f"Task Data: {data}")
             
+            # If 'pages' isn't provided, we pass None to let the scraper auto-detect
             url = data.get("page_url")
-            pages = int(data.get("pages", settings.DEFAULT_SCRAPE_PAGES))
+            raw_pages = data.get("pages")
+            pages = int(raw_pages) if raw_pages else None
+            logger.info(f"Requested Pages: {pages if pages else 'Auto-detect'} (Raw value: {raw_pages})")
+            
             mode = data.get("extraction_mode", "manual")
 
-            scraper = UpworkScraper(self.browser_manager, self.session_manager)
+            scraper = UpworkScraper(self.browser_manager)
             
             try:
                 async def callback(**kwargs):
@@ -114,13 +166,7 @@ class RedisStreamReader:
         """Main loop: listens for new messages in the stream."""
         await self.connect()
         
-        # Browser Warmup
-        logger.info("🛠️  Warming up persistent session...")
-        temp_tab = await self.browser_manager.create_tab()
-        try:
-            await self.session_manager.verify_or_login(temp_tab)
-        finally:
-            await temp_tab.close()
+        logger.info(f"📡 Listening for tasks on stream: {self.stream_name}")
             
         try:
             while True:

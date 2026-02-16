@@ -16,9 +16,14 @@ from src.core.config import settings
 import asyncio
 from contextlib import asynccontextmanager
 from src.services.redis_stream_reader import RedisStreamReader
+from src.core.database import init_db
+from src.models import job_card # Ensure models are loaded for init_db
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize Database
+    await init_db()
+    
     # Start the Redis Stream Reader in the background
     reader = RedisStreamReader()
     task = asyncio.create_task(reader.run())

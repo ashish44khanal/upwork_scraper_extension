@@ -2,6 +2,7 @@ import asyncio
 import os
 import logging
 import nodriver as uc
+from nodriver import cdp
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
@@ -25,13 +26,20 @@ class BrowserManager:
         if not hasattr(self, 'initialized'):
             self.headless = headless
             self.profile_path = profile_path or os.path.abspath("upwork_profile_nd")
+            self._shutdown_event = asyncio.Event()
             self.initialized = True
 
     async def get_browser(self) -> uc.Browser:
         """Get or initialize the singleton browser instance."""
         async with self._lock:
-            if self._browser and self._is_alive():
-                return self._browser
+            if self._browser:
+                try:
+                    # Quick check if connection is active
+                    await self._browser.connection.send(cdp.browser.get_version())
+                    return self._browser
+                except:
+                    logger.warning("Browser connection lost. Re-initializing...")
+                    self._browser = None
             
             self._browser = await self._start_browser()
             return self._browser
@@ -45,7 +53,7 @@ class BrowserManager:
             return False
 
     async def _start_browser(self) -> uc.Browser:
-        """Launches the browser with proper cleanup and arguments."""
+        """Launches the browser with proactive cleanup and arguments."""
         logger.info("Initializing Singleton Nodriver Browser...")
         
         browser_args = [
@@ -54,13 +62,18 @@ class BrowserManager:
             "--disable-setuid-sandbox",
             "--disable-features=IsolateOrigins,site-per-process",
             "--disable-session-crashed-bubble",
-            "--remote-allow-origins=*"
+            "--remote-allow-origins=*",
+            "--disable-blink-features=AutomationControlled", # Stealth
         ]
+
+        # PROACTIVE CLEANUP: Kill any hanging instances BEFORE the first attempt
+        self._aggressive_cleanup()
+        await asyncio.sleep(1.5) # Allow OS to release port/profile resources
 
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                # Remove stale locks before launch
+                # Extra lock check right before launch
                 self._cleanup_stale_locks()
                 
                 browser = await uc.start(
@@ -70,6 +83,7 @@ class BrowserManager:
                     sandbox=False,
                 )
                 logger.info("Browser launched successfully.")
+                self._shutdown_event.clear()
                 return browser
             except Exception as e:
                 if attempt < max_retries:
@@ -91,22 +105,31 @@ class BrowserManager:
                 logger.warning(f"Could not remove lock file: {e}")
 
     def _aggressive_cleanup(self):
-        """Kills zombie chrome processes on Unix systems."""
+        """Kills zombie chrome processes using pkill -9 for reliability."""
+        logger.info("Executing aggressive process cleanup...")
         if os.name == 'posix':
-            logger.info("Executing aggressive process cleanup...")
-            os.system('pkill -f "Google Chrome" || true')
-            os.system('pkill -f "chrome" || true')
-            self._cleanup_stale_locks()
+            # Force kill all Chrome related processes
+            os.system('pkill -9 -f "Google Chrome" || true')
+            os.system('pkill -9 -f "chrome" || true')
+            os.system('pkill -9 -f "nodriver" || true')
+        
+        self._cleanup_stale_locks()
 
     async def close_all(self):
-        """Shutdown the browser and all tabs."""
+        """Shutdown the browser and all tabs gracefully."""
         async with self._lock:
             if self._browser:
                 try:
-                    # Closing main browser
-                    await self._browser.stop()
-                except:
-                    pass
+                    logger.info("Closing browser gracefully...")
+                    self._shutdown_event.set()
+                    if self._browser.connection:
+                        await self._browser.stop()
+                    else:
+                        if self._browser.process:
+                            self._browser.process.kill()
+                except Exception as e:
+                    logger.warning(f"Error during browser shutdown: {e}")
+                    self._aggressive_cleanup()
                 finally:
                     self._browser = None
                     logger.info("Singleton Browser shut down.")
@@ -114,4 +137,11 @@ class BrowserManager:
     async def create_tab(self) -> uc.Tab:
         """Create a new tab in the singleton browser."""
         browser = await self.get_browser()
-        return await browser.get("about:blank")
+        try:
+            return await browser.get("about:blank")
+        except Exception as e:
+            logger.warning(f"Failed to create tab: {e}. Attempting browser restart...")
+            async with self._lock:
+                self._browser = None
+            browser = await self.get_browser()
+            return await browser.get("about:blank")

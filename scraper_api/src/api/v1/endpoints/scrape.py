@@ -5,7 +5,6 @@ from src.schemas.extraction import DOMSubmission, ExtractedData, UpworkSearchReq
 from src.services.gemini_extractor import GeminiExtractor
 from src.services.upwork_scraper import UpworkScraper
 from src.core.browser import BrowserManager
-from src.services.session_manager import UpworkSessionManager
 import json
 import os
 from datetime import datetime
@@ -99,8 +98,7 @@ async def scrape_upwork(request: UpworkScrapeRequest):
     """
     try:
         browser_manager = BrowserManager(headless=request.headless)
-        session_manager = UpworkSessionManager(browser_manager)
-        scraper = UpworkScraper(browser_manager, session_manager)
+        scraper = UpworkScraper(browser_manager)
         
         # Note: In the refactored scraper, results are typically handled via callbacks
         # For this direct API endpoint, we'll collect them in a list
