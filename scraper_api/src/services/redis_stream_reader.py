@@ -22,7 +22,6 @@ class RedisStreamReader:
     """
     def __init__(self):
         self.redis_client = None
-        self.browser_manager = BrowserManager(headless=False)
         
         # Concurrency control
         self.semaphore = asyncio.Semaphore(8)
@@ -141,7 +140,9 @@ class RedisStreamReader:
             
             mode = data.get("extraction_mode", "manual")
 
-            scraper = UpworkScraper(self.browser_manager)
+            # Create an independent browser instance for this specific task
+            browser_manager = BrowserManager(headless=False, session_id=message_id)
+            scraper = UpworkScraper(browser_manager)
             
             try:
                 async def callback(**kwargs):
@@ -161,6 +162,9 @@ class RedisStreamReader:
                 logger.info(f"✅ Completed task {message_id}")
             except Exception as e:
                 logger.error(f"❌ Task {message_id} failed: {e}")
+            finally:
+                # Ensure the independent browser is closed
+                await browser_manager.close()
 
     async def run(self):
         """Main loop: listens for new messages in the stream."""
@@ -183,7 +187,9 @@ class RedisStreamReader:
                     for message_id, data in msgs:
                         asyncio.create_task(self.process_message(message_id, data))
         finally:
-            await self.browser_manager.close_all()
+            # Global cleanup of redis connection
+            if self.redis_client:
+                await self.redis_client.close()
 
 async def main():
     logging.basicConfig(

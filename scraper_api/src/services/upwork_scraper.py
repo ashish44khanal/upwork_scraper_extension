@@ -13,6 +13,7 @@ import nodriver as uc
 from nodriver import cdp
 
 from src.core.browser import BrowserManager
+from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,8 @@ class UpworkScraper:
     
     def __init__(self, browser_manager: BrowserManager):
         self.browser_manager = browser_manager
-        self.session_id = str(random.randint(1000, 9999))
+        # Use the session_id from browser_manager for consistency in logs/isolation
+        self.session_id = browser_manager.session_id
         self._last_pagination_data = None
         self._pagination_event = asyncio.Event()
 
@@ -55,7 +57,19 @@ class UpworkScraper:
                 
             tab.add_handler(cdp.network.ResponseReceived, handler)
             
-            # This triggers the GraphQL request we want to intercept
+            # Trigger initial navigation to check session
+            await tab.get("https://www.upwork.com/nx/find-work/best-matches")
+            await self.wait_for_cloudflare(tab)
+            
+            # Check if redirected to login
+            if "login" in tab.url or await self._is_login_page(tab):
+                await self._perform_login(tab)
+                # Verify if we actually got past login
+                if "login" in tab.url or await self._is_login_page(tab):
+                    logger.error("❌ Still on login page after authentication attempt. Aborting.")
+                    raise ScraperException("Authentication failed or 2FA required.")
+            
+            # Now navigate to the real target
             await tab.get(product_url)
             await self.wait_for_cloudflare(tab)
             
@@ -141,6 +155,11 @@ class UpworkScraper:
         slider_appeared = await self._wait_for_element(tab, self.MODAL_SELECTOR, timeout=5.0)
         if not slider_appeared:
             return None
+        
+        # Wait for "Save job" text to ensure modal is loaded
+        save_job_visible = await self._wait_for_text(tab, "Save job", timeout=5.0)
+        if not save_job_visible:
+            logger.warning(f"  - 'Save job' button not found for tile {card_index}, but proceeding...")
             
         await asyncio.sleep(random.uniform(0.5, 1.0)) # Jitter
         
@@ -208,7 +227,6 @@ class UpworkScraper:
                         if text:
                             match = re.search(r"of\s+(\d+)", text, re.IGNORECASE)
                             if match:
-                                total_pages = int(match.group(1))
                                 logger.info(f"✅ SUCCESS via .sr-only: {total_pages} pages found!")
                                 return total_pages
                     except Exception as e:
@@ -317,6 +335,15 @@ class UpworkScraper:
         """Polls for a generic element."""
         try:
             el = await tab.select(selector, timeout=timeout)
+            return bool(el)
+        except:
+            return False
+
+    async def _wait_for_text(self, tab: uc.Tab, text: str, timeout: float = 5.0) -> bool:
+        """Polls for specific text on the page."""
+        try:
+            # nodriver's find method is great for text
+            el = await tab.find(text, timeout=timeout)
             return bool(el)
         except:
             return False
@@ -441,3 +468,96 @@ class UpworkScraper:
         except Exception as e:
             # Silent fail for non-matching or malformed payloads
             pass
+    async def _is_login_page(self, tab: uc.Tab) -> bool:
+        """Heuristic to check if we are on the login page."""
+        try:
+            content = await tab.evaluate("document.body.innerText")
+            return "Log in to Upwork" in content or "login" in tab.url
+        except:
+            return False
+
+    async def _perform_login(self, tab: uc.Tab):
+        """Executes the multi-step login flow."""
+        logger.info("🔐 Starting automated login flow...")
+        
+        if not settings.UPWORK_USERNAME or not settings.UPWORK_PASSWORD:
+            logger.error("❌ UPWORK_USERNAME or UPWORK_PASSWORD not set in environment.")
+            return
+
+        try:
+            # 1. Username
+            logger.info("  - Entering username...")
+            username_field = await tab.select('input[id="login_username"]', timeout=15)
+            if username_field:
+                await self._type_humanly(username_field, settings.UPWORK_USERNAME)
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                
+                continue_btn = await tab.select('button[id="login_password_continue"]', timeout=10)
+                if continue_btn:
+                    await continue_btn.click()
+                    await asyncio.sleep(random.uniform(2.0, 4.0)) # Longer wait after username
+                else:
+                    logger.error("❌ 'Continue' button not found after username.")
+                    return
+            else:
+                logger.error("❌ Username field not found.")
+                return
+            
+            # 2. Password
+            logger.info("  - Entering password...")
+            password_field = await tab.select('input[id="login_password"]', timeout=15)
+            if password_field:
+                await self._type_humanly(password_field, settings.UPWORK_PASSWORD)
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                
+                login_btn = await tab.select('button[id="login_control_continue"]', timeout=10)
+                if login_btn:
+                    await asyncio.sleep(random.uniform(0.5, 1.5)) # Hesitate before final click
+                    await login_btn.click()
+                else:
+                    logger.error("❌ 'Login' button not found after password.")
+                    return
+            else:
+                logger.error("❌ Password field not found.")
+                return
+                
+            # 3. Wait for dashboard or 2FA
+            logger.info("⏳ Waiting for login completion or 2FA prompt...")
+            start = datetime.now()
+            while (datetime.now() - start).total_seconds() < 60:
+                if "login" not in tab.url:
+                    # Double check if we are actually logged in (e.g. redirected to home or find-work)
+                    if "upwork.com" in tab.url and "login" not in tab.url:
+                        logger.info("✅ Login successful (redirected away from login page).")
+                        return
+                
+                # Check for 2FA screen text
+                try:
+                    content = await tab.evaluate("document.body.innerText")
+                    if "Two-step verification" in content or "Enter the code" in content:
+                        logger.warning("⚠️ 2FA REQUIRED. Please check your secondary device or browser profile.")
+                        # We can't automate 2FA, so we wait and hope for manual/profile intervention
+                        await asyncio.sleep(10)
+                except:
+                    pass
+                
+                await asyncio.sleep(2)
+                
+        except Exception as e:
+            logger.error(f"❌ Login failed: {e}")
+            await tab.save_screenshot("storage/login_fail.jpg")
+
+    async def _type_humanly(self, element: uc.Element, text: str):
+        """Simulates character-by-character typing with VERY slow random delays."""
+        try:
+            for char in text:
+                await element.send_keys(char)
+                # Much slower: random delay between 0.3s and 0.8s
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                # Higher chance of longer "thinking" pauses
+                if random.random() < 0.2:
+                    await asyncio.sleep(random.uniform(1.5, 3.5))
+        except Exception as e:
+            logger.warning(f"Error during human typing: {e}")
+            # Fallback to instant send_keys if character-by-character fails
+            await element.send_keys(text)

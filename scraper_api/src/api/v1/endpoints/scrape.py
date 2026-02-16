@@ -97,47 +97,57 @@ async def scrape_upwork(request: UpworkScrapeRequest):
     Logs in each run using UPWORK_USERNAME/UPWORK_PASSWORD from env.
     """
     try:
-        browser_manager = BrowserManager(headless=request.headless)
+        session_id = f"api_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        browser_manager = BrowserManager(headless=request.headless, session_id=session_id)
         scraper = UpworkScraper(browser_manager)
         
-        # Note: In the refactored scraper, results are typically handled via callbacks
-        # For this direct API endpoint, we'll collect them in a list
-        all_results = []
-        async def sync_callback(**kwargs):
-            # This handles the card extraction logic normally done by RedisStreamReader
-            # For simplicity in this direct endpoint, we return the filtered_html
-            # although usually the endpoint would trigger a full extraction later.
-            all_results.append(kwargs.get("filtered_html"))
-
-        await scraper.scrape_jobs(
-            product_url=request.product_url,
-            no_of_pages_to_scrape=request.no_of_pages_to_scrape,
-            on_card_data_async=sync_callback
-        )
-        
-        if not all_results:
-            raise HTTPException(
-                status_code=404,
-                detail="No jobs found or scraper was blocked."
+        try:
+            # Note: In the refactored scraper, results are typically handled via callbacks
+            # For this direct API endpoint, we'll collect them in a list
+            all_results = []
+            async def sync_callback(**kwargs):
+                # This handles the card extraction logic normally done by RedisStreamReader
+                # For simplicity in this direct endpoint, we return the filtered_html
+                # although usually the endpoint would trigger a full extraction later.
+                all_results.append(kwargs.get("filtered_html"))
+    
+            await scraper.scrape_jobs(
+                product_url=request.product_url,
+                no_of_pages_to_scrape=request.no_of_pages_to_scrape,
+                on_card_data_async=sync_callback
             )
             
-        # For the direct API, we might want to run Gemini extraction immediately 
-        # on the collected HTML chunks if the request expects ExtractedData
-        final_data = []
-        for html in all_results:
-            extracted = extractor.extract_from_html(html)
-            final_data.append(ExtractedData(**extracted))
-            
-        return final_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        print(f"Upwork critical API error: {e}")
-        traceback.print_exc()
+            if not all_results:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No jobs found or scraper was blocked."
+                )
+                
+            # For the direct API, we might want to run Gemini extraction immediately 
+            # on the collected HTML chunks if the request expects ExtractedData
+            final_data = []
+            for html in all_results:
+                extracted = extractor.extract_from_html(html)
+                final_data.append(ExtractedData(**extracted))
+                
+            return final_data
+        except HTTPException:
+            raise
+        except Exception as e:
+            import traceback
+            print(f"Upwork critical API error: {e}")
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Automation failure: {str(e)}"
+            )
+        finally:
+            await browser_manager.close()
+    except Exception as outer_e:
+        # Fallback for errors before browser is fully initialized
         raise HTTPException(
             status_code=500,
-            detail=f"Automation failure: {str(e)}"
+            detail=f"API entry point failure: {str(outer_e)}"
         )
 
 def decompress_dom(compressed_b64: str) -> str:
