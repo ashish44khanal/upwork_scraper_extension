@@ -1,0 +1,111 @@
+
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+# Diagnostic reports (https://nodejs.org/api/report.html)
+# Docker
+# IDE - VSCode
+# IDEs
+# IDEs and editors
+# Logs
+# Node.js
+# OS
+# Python
+# Runtime data
+# Scraper Specific
+# Tests
+# Virtual Environments
+# compiled output
+# dotenv environment variable files
+# temp directory
+*$py.class
+**/*.html
+**/*.jpeg
+**/*.jpg
+**/*.log
+**/*.mp4
+**/*.pdf
+**/*.png
+**/brave_data/
+**/cookies.json
+**/scraped_jobs.json
+**/storage/
+**/upwork.json
+**/upwork_profile*/
+*.egg
+*.egg-info/
+*.html
+*.jpeg
+*.jpg
+*.launch
+*.log
+*.mp4
+*.pdf
+*.pid
+*.pid.lock
+*.png
+*.py[cod]
+*.seed
+*.so
+*.sublime-workspace
+*.swo
+*.swp
+.DS_Store
+.Python
+.c9/
+.classpath
+.dockerignore
+.eggs/
+.env
+.env.development.local
+.env.local
+.env.production.local
+.env.test.local
+.idea/
+.installed.cfg
+.project
+.settings/
+.temp
+.tmp
+.venv
+.vscode/
+.vscode/*
+/.idea
+/.nyc_output
+/build
+/build/
+/coverage
+/dist
+/dist/
+/node_modules
+ENV/
+Thumbs.db
+__pycache__/
+build/
+cookies.json
+develop-eggs/
+dist/
+downloads/
+eggs/
+env/
+lerna-debug.log*
+lib/
+lib64/
+logs
+node_modules/
+npm-debug.log*
+parts/
+pids
+pnpm-debug.log*
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+scraped_jobs.json
+sdist/
+storage/
+upwork.json
+upwork_profile*/
+var/
+venv/
+wheels/
+yarn-debug.log*
+yarn-error.log*
