@@ -109,3 +109,4 @@ venv/
 wheels/
 yarn-debug.log*
 yarn-error.log*
+scraper_api/brave_data*/
