@@ -21,15 +21,15 @@ class Settings(BaseSettings):
     REDIS_CONSUMER_NAME: str = "scraper_consumer_1"
     
     # Postgres settings
-    POSTGRES_HOST: str = "localhost"
-    POSTGRES_PORT: int = 5432
-    POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: str = "postgres"
-    POSTGRES_DB: str = "upwork_scraper_db"
+    DB_HOST: str = "localhost"
+    DB_PORT: int = 5432
+    DB_USER: str = "postgres"
+    DB_PASSWORD: str = "postgres"
+    DB_NAME: str = "upwork_db"
 
     @property
     def DATABASE_URL(self) -> str:
-        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        return f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
     
     # New extraction stream for downstream processing (published per card)
     EXTRACTION_STREAM_NAME: str = "upwork_job_extraction_stream"
@@ -40,7 +40,18 @@ class Settings(BaseSettings):
     # Storage settings
     STORAGE_DIR: str = "storage"
 
-    model_config = SettingsConfigDict(case_sensitive=True)
+    # API Key for extraction logic
+    GEMINI_API_KEY: Optional[str] = None
+    
+    # Port configuration
+    PORT: int = 8000
+
+    model_config = SettingsConfigDict(
+        case_sensitive=True,
+        env_file=("../.env", ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
 
 settings = Settings()

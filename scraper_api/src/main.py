@@ -32,9 +32,10 @@ from src.models import job_card # Ensure models are loaded for init_db
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize Database
-    logger.info("Initializing database...")
-    await init_db()
+    # Note: Database initialization is handled by extraction_service migrations
+    # to maintain a single source of truth in the shared database.
+    # logger.info("Initializing database...")
+    # await init_db()
     
     # Start the Redis Stream Reader in the background
     logger.info("Starting Redis Stream Reader...")

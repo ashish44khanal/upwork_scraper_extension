@@ -28,11 +28,8 @@ trap cleanup SIGINT SIGTERM
 echo "🚀 Starting Hybrid Microservices Stack..."
 
 # 1. Start Docker Compose (Infrastructure + Node Services)
-echo "  -> Starting Docker Infrastructure (DB, Redis, Gateway, Extraction)..."
+echo "  -> Starting Docker Infrastructure (DB, Redis, Gateway, Extraction, Migrations)..."
 docker compose up -d --remove-orphans
-
-echo "  -> Running Database Migrations..."
-docker compose exec extraction_service npm run migration:run:prod
 
 # 2. Start Scraper API (Local)
 echo "  -> Starting Scraper API (Local)..."
