@@ -4,13 +4,13 @@ services:
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
-      POSTGRES_DB: ${DB_NAME:-upwork_scraper_db}
+      POSTGRES_DB: ${DB_NAME:-upwork_db}
     ports:
       - "${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-upwork_scraper_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-upwork_db}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -25,9 +25,9 @@ services:
     environment:
       DB_HOST: db
       DB_PORT: 5432
-      DB_USERNAME: ${DB_USER:-postgres}
+      DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
-      DB_NAME: ${DB_NAME:-upwork_scraper_db}
+      DB_NAME: ${DB_NAME:-upwork_db}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       PORT: ${PORT:-3000}
@@ -62,9 +62,9 @@ services:
       REDIS_PORT: 6379
       DB_HOST: db
       DB_PORT: 5432
-      DB_USERNAME: ${DB_USER:-postgres}
+      DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
-      DB_NAME: ${DB_NAME:-upwork_scraper_db}
+      DB_NAME: ${DB_NAME:-upwork_db}
     depends_on:
       db:
         condition: service_healthy

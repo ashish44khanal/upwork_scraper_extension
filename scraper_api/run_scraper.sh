@@ -4,7 +4,7 @@
 export POSTGRES_HOST=localhost
 export POSTGRES_USER=postgres
 export POSTGRES_PASSWORD=postgres
-export POSTGRES_DB=upwork_scraper_db
+export POSTGRES_DB=upwork_db
 
 # Redis is running in Docker and exposed on 6379
 export REDIS_HOST=localhost
