@@ -25,13 +25,41 @@ cleanup() {
 # Trap Ctrl+C (SIGINT) and SIGTERM
 trap cleanup SIGINT SIGTERM
 
+# Parse arguments
+BUILD_FLAG=""
+RUN_MIGRATION=false
+for arg in "$@"; do
+    if [ "$arg" == "--build" ]; then
+        BUILD_FLAG="--build"
+    fi
+    if [ "$arg" == "--runMigration" ]; then
+        RUN_MIGRATION=true
+    fi
+done
+
 echo "🚀 Starting Hybrid Microservices Stack..."
 
 # 1. Start Docker Compose (Infrastructure + Node Services)
-echo "  -> Starting Docker Infrastructure (DB, Redis, Gateway, Extraction, Migrations)..."
-docker compose up -d --remove-orphans
+echo "  -> Starting Docker Infrastructure (DB, Redis, Gateway, Extraction)..."
+docker compose up -d $BUILD_FLAG --remove-orphans
 
-# 2. Start Scraper API (Local)
+# 2. Run Database Migrations if requested
+if [ "$RUN_MIGRATION" = true ]; then
+    echo "  -> Waiting for Database to be healthy..."
+    # Wait for the DB container to be healthy (using the healthcheck defined in docker-compose.yml)
+    # We use 'docker compose ps' to find the container name dynamically
+    DB_CONTAINER=$(docker compose ps -q db)
+    until [ "$(docker inspect -f '{{.State.Health.Status}}' $DB_CONTAINER)" == "healthy" ]; do
+        echo "     (Waiting...)"
+        sleep 2
+    done
+    
+    echo "  -> Running Database Migrations (Inside Container)..."
+    # We run the migration inside the container to avoid needing node_modules on the host
+    docker compose exec extraction_service npm run migration:run:prod
+fi
+
+# 3. Start Scraper API (Local)
 echo "  -> Starting Scraper API (Local)..."
 (cd scraper_api && ./run_scraper.sh) &
 pids+=($!)

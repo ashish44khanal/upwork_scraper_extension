@@ -168,6 +168,7 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
         const entity = this.jobRepository.create({
           ...extractedData,
           event_id: eventId,
+          job_url: jobCard.url,
           scraped_at: new Date(),
         });
 

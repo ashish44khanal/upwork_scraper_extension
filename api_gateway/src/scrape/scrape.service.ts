@@ -33,7 +33,7 @@ export class ScrapeService {
 
     if (url && url.trim() !== '') {
       // Use ILIKE for both and be more permissive with metadata search
-      queryBuilder.andWhere('(jc.url ILIKE :url OR jc.metadata_json->>\'parent_url\' ILIKE :url)', { 
+      queryBuilder.andWhere('(ej.job_url ILIKE :url OR jc.url ILIKE :url OR jc.metadata_json->>\'parent_url\' ILIKE :url)', { 
         url: `%${url.trim()}%`
       });
     }
@@ -62,6 +62,95 @@ export class ScrapeService {
       take: 50,
     });
   }
+
+  async getExtractedDataForCsv(url: string): Promise<string> {
+    const queryBuilder = this.extractedJobRepo.createQueryBuilder('ej')
+      .innerJoin(JobCardEntity, 'jc', 'jc.event_id = ej.event_id')
+      .select([
+        'ej.*',
+      ]);
+
+    if (url && url.trim() !== '') {
+      queryBuilder.andWhere('(jc.url ILIKE :url OR jc.metadata_json->>\'parent_url\' ILIKE :url)', { 
+        url: `%${url.trim()}%`
+      });
+    }
+
+    const data = await queryBuilder
+      .orderBy('ej.scraped_at', 'DESC')
+      .getRawMany();
+
+    if (data.length === 0) {
+      return '';
+    }
+
+    // Define headers for CSV
+    const headers = [
+      'ID', 'URL', 'Job Title', 'Published Info', 'Location', 'Summary', 
+      'Is Featured', 'Duration', 'Commitment', 'Project Type', 'Experience Level', 
+      'Client Location', 'Jobs Published', 'Hire Rate', 'Total Spent', 
+      'Avg Hourly Rate', 'Total Paid Hours', 'Account Active Date', 
+      'Proposals Received', 'Invites Sent', 'Talent Type', 'Skills', 
+      'Total Reviews', 'Avg Rating', 'Scraped At'
+    ];
+
+    const rows = data.map(item => {
+      // Handle the complex fields from raw query
+      // Note: getRawMany might return strings for some types depending on the driver
+      let skills = '';
+      try {
+        const skillsObj = typeof item.list_of_skills_and_expertise_required_for_the_job === 'string'
+          ? JSON.parse(item.list_of_skills_and_expertise_required_for_the_job)
+          : item.list_of_skills_and_expertise_required_for_the_job;
+        skills = Array.isArray(skillsObj) ? skillsObj.join(', ') : '';
+      } catch (e) {
+        skills = '';
+      }
+
+      let ratingInfo = { total_reviews: '', avg_rating: '' };
+      try {
+        ratingInfo = typeof item.client_rating_info === 'string'
+          ? JSON.parse(item.client_rating_info)
+          : item.client_rating_info || {};
+      } catch (e) {}
+
+      const fields = [
+        item.id,
+        item.job_url,
+        item.job_title,
+        item.job_published_info,
+        item.job_location_info,
+        item.job_summary?.replace(/\n/g, ' '),
+        item.is_featured_job,
+        item.product_duration,
+        item.hourly_commitment,
+        item.project_type,
+        item.experience_level,
+        item.client_location,
+        item.total_jobs_published_so_far,
+        item.hire_rate,
+        item.total_spent,
+        item.avg_hourly_rate_paid,
+        item.total_paid_hours,
+        item.client_account_active_date,
+        item.no_of_proposal_received,
+        item.no_of_invites_sent,
+        item.talent_type,
+        skills,
+        ratingInfo.total_reviews,
+        ratingInfo.avg_rating,
+        item.scraped_at
+      ];
+
+      return fields.map(val => {
+        const str = String(val ?? '');
+        return `"${str.replace(/"/g, '""')}"`;
+      }).join(',');
+    });
+
+    return [headers.join(','), ...rows].join('\n');
+  }
+
   findOne(id: number) { return {} }
   update(id: number, dto: any) { return {} }
   remove(id: number) { return {} }

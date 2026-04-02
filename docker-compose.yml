@@ -38,22 +38,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-      db_migrator:
-        condition: service_completed_successfully
-
-  db_migrator:
-    build: ./extraction_service
-    environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_USERNAME: ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-postgres}
-      DB_NAME: ${DB_NAME:-upwork_scraper_db}
-    depends_on:
-      db:
-        condition: service_healthy
-    command: >
-      sh -c "npm run migration:run:prod"
 
   extraction_service:
     build: ./extraction_service
@@ -70,8 +54,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-      db_migrator:
-        condition: service_completed_successfully
     command: >
       sh -c "node dist/main"
 

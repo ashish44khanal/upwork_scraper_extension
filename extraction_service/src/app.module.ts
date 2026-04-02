@@ -19,9 +19,9 @@ import { ManualExtractionService } from './extraction/manual-extraction.service'
         type: 'postgres',
         host: config.get<string>('DB_HOST', 'localhost'),
         port: config.get<number>('DB_PORT', 5432),
-        username: config.get<string>('DB_USERNAME', 'postgres'),
+        username: config.get<string>('DB_USER', 'postgres'),
         password: config.get<string>('DB_PASSWORD', 'postgres'),
-        database: config.get<string>('DB_NAME', 'upwork_scraper_db'),
+        database: config.get<string>('DB_NAME', 'upwork_db'),
         entities: [ExtractedJobEntity, JobCardEntity],
         synchronize: false, // Don't modify existing tables
       }),

@@ -123,8 +123,31 @@ export class ManualExtractionService {
     jobData.avg_hourly_rate_paid = $('[data-qa="client-hourly-rate"]').text().trim() || undefined;
     jobData.total_paid_hours = $('[data-qa="client-hours"]').text().trim() || undefined;
     jobData.client_account_active_date = $('[data-qa="client-contract-date"]').text().trim() || undefined;
-    jobData.no_of_proposal_received = $('[data-test="Proposals"] .value').text().trim() || undefined;
-    jobData.no_of_invites_sent = $('[data-test="InvitesSent"] .value').text().trim() || '0';
+
+    // Activity on this job
+    const activitySection = $('[data-test="ClientActivity"]');
+    if (activitySection.length > 0) {
+      const activity: any = {};
+      activitySection.find('.ca-item').each((_, el) => {
+        const $item = $(el);
+        const title = $item.find('.title').text().trim().replace(':', '').toLowerCase();
+        const value = $item.find('.value').text().trim();
+
+        if (title.includes('proposals')) activity.proposals = value;
+        else if (title.includes('last viewed')) activity.last_viewed_by_client = value;
+        else if (title.includes('interviewing')) activity.interviewing = value;
+        else if (title.includes('invites sent')) activity.invites_sent = value;
+        else if (title.includes('unanswered invites')) activity.unanswered_invites = value;
+      });
+      jobData.client_activity = activity;
+      
+      // Sync legacy fields
+      jobData.no_of_proposal_received = activity.proposals;
+      jobData.no_of_invites_sent = activity.invites_sent;
+    } else {
+      jobData.no_of_proposal_received = $('[data-test="Proposals"] .value').text().trim() || undefined;
+      jobData.no_of_invites_sent = $('[data-test="InvitesSent"] .value').text().trim() || '0';
+    }
 
     // 8. Skills Required
     const skills: string[] = [];
@@ -137,11 +160,19 @@ export class ManualExtractionService {
     jobData.list_of_skills_and_expertise_required_for_the_job = skills;
 
     // 9. Client Rating
-    const ratingElem = $('[data-qa="client-rating"]');
+    const ratingElem = $('[data-testid="buyer-rating"], .rating, [data-qa="client-rating"]').first();
     if (ratingElem.length > 0) {
+      const detailedText = ratingElem.find('span.nowrap, .nowrap').text().trim();
+      const detailedMatch = detailedText.match(/(\d+\.?\d*)\s+of\s+(\d+)\s+reviews/);
+      
       jobData.client_rating_info = {
-        avg_rating: ratingElem.find('.air3-rating-star strong').text().trim() || undefined,
-        total_reviews: ratingElem.text().match(/\d+\s+review/)?.[0] || undefined,
+        avg_rating: detailedMatch?.[1] || 
+                    ratingElem.find('.air3-rating-value-text').text().trim() || 
+                    ratingElem.find('.air3-rating-star strong').text().trim() || 
+                    undefined,
+        total_reviews: (detailedMatch?.[2] ? `${detailedMatch[2]} reviews` : undefined) || 
+                       ratingElem.text().match(/\d+\s+review/)?.[0] || 
+                       undefined,
       };
     }
 
@@ -160,19 +191,44 @@ export class ManualExtractionService {
     };
 
     // 11. Recent History
+    const historySection = $('[data-test="WorkHistory"]').first();
     const historyJobs: any[] = [];
-    $('[data-test="WorkHistory"] article, [data-qa="client-recent-history"] article').each((_, el) => {
-      historyJobs.push({
-        name: $(el).find('h4, .job-title').first().text().trim(),
-        job_link: $(el).find('a').first().attr('href') || null,
-        start_date: $(el).find('.date, [data-qa="start-date"]').text().trim(),
-        no_of_hours: $(el).find('.hours').text().trim() || null,
-        per_hour_rate: $(el).find('.rate').text().trim() || null,
-        job_employee: $(el).find('.freelancer-name').text().trim(),
+    
+    if (historySection.length > 0) {
+      historySection.find('[data-cy="job"]').each((_, el) => {
+        const $item = $(el);
+        const statsText = $item.find('[data-cy="stats"]').text().trim().replace(/\s+/g, ' ');
+        const amountType = statsText.includes('Fixed-price') ? 'Fixed-price' : (statsText.includes('hrs') ? 'Hourly' : null);
+        
+        // Amount extraction
+        let amount: string | null = null;
+        if (amountType === 'Fixed-price') {
+            amount = statsText.match(/\$\d+\.?\d*/)?.[0] || null;
+        } else if (amountType === 'Hourly') {
+            amount = statsText.match(/Billed:\s*(\$\d+\.?\d*)/)?.[1] || statsText.match(/\$\d+\.?\d*/)?.[0] || null;
+        }
+
+        historyJobs.push({
+          job_title: $item.find('[data-cy="job-title"]').text().trim(),
+          job_link: $item.find('[data-cy="job-title"]').attr('href') || null,
+          project_date_timeline: $item.find('[data-test="Stats"] .text-body-sm').first().text().trim().replace(/\s+/g, ' '),
+          freelancer_rating: $item.find('.air3-rating-value-text').first().text().trim() || null,
+          freelancer_name: $item.find('[data-test="FreelancerLink"] a').text().trim(),
+          freelancer_feedback: $item.find('.air3-truncation span[id]').first().text().trim() || 
+                               $item.find('.air3-truncation').first().text().replace('more', '').trim() ||
+                               $item.find('.text-light-on-muted').first().text().trim() || 
+                               null,
+          amount: amount,
+          amount_type: amountType
+        });
       });
-    });
+    }
+
+    const historyTitle = $('[data-cy="work-history-title"]').text().trim();
+    const totalHistoryCount = historyTitle.match(/\((\d+)\)/)?.[1];
+
     jobData.client_recent_history = {
-      total_numbers: historyJobs.length.toString(),
+      total_numbers: totalHistoryCount || historyJobs.length.toString(),
       jobs_in_progress: historyJobs,
     };
 

@@ -132,13 +132,31 @@ export class ExtractedJobDto {
   client_recent_history?: {
     total_numbers?: string;
     jobs_in_progress?: Array<{
-      name: string;
+      job_title: string;
       job_link: string | null;
-      start_date: string;
-      no_of_hours: string | null;
-      per_hour_rate: string | null;
-      job_employee: string;
+      project_date_timeline: string;
+      freelancer_rating: string | null;
+      freelancer_name: string;
+      freelancer_feedback: string | null;
+      amount: string | null;
+      amount_type: string | null;
     }>;
+  };
+
+  @ApiProperty({ required: false, description: 'The source URL of the job post' })
+  @IsString()
+  @IsOptional()
+  job_url?: string;
+
+  @ApiProperty({ required: false })
+  @IsObject()
+  @IsOptional()
+  client_activity?: {
+    proposals?: string;
+    last_viewed_by_client?: string;
+    interviewing?: string;
+    invites_sent?: string;
+    unanswered_invites?: string;
   };
 
   @ApiProperty({ required: false })

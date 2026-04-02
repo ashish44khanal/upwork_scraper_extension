@@ -8,7 +8,17 @@ describe('ScrapeController', () => {
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [ScrapeController],
-      providers: [ScrapeService],
+      providers: [
+        {
+          provide: ScrapeService,
+          useValue: {
+            create: jest.fn(),
+            findExtractedValues: jest.fn(),
+            getExtractedDataForCsv: jest.fn(),
+            findAll: jest.fn(),
+          },
+        },
+      ],
     }).compile();
 
     controller = module.get<ScrapeController>(ScrapeController);
