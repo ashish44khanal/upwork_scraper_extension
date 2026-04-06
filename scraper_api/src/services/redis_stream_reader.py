@@ -24,7 +24,7 @@ class RedisStreamReader:
         self.redis_client = None
         
         # Concurrency control
-        self.semaphore = asyncio.Semaphore(8)
+        self.semaphore = asyncio.Semaphore(1)
         
         # Redis config
         self.stream_name = settings.REDIS_STREAM_NAME
@@ -107,7 +107,9 @@ class RedisStreamReader:
                 msg_id = await self.redis_client.xadd(
                     settings.EXTRACTION_STREAM_NAME, 
                     event_data,
-                    id=predictable_id
+                    id=predictable_id,
+                    maxlen=settings.REDIS_STREAM_MAXLEN,
+                    approximate=True
                 )
             except redis.ResponseError as re:
                 if "equal or smaller" in str(re):
@@ -115,7 +117,9 @@ class RedisStreamReader:
                     msg_id = await self.redis_client.xadd(
                         settings.EXTRACTION_STREAM_NAME, 
                         event_data,
-                        id="*"
+                        id="*",
+                        maxlen=settings.REDIS_STREAM_MAXLEN,
+                        approximate=True
                     )
                 else:
                     raise re
@@ -125,9 +129,62 @@ class RedisStreamReader:
         except Exception as e:
             logger.error(f"Card processing or DB saving error: {e}")
 
+    async def move_to_dlq(self, message_id, data, reason: str):
+        """Moves a failed message to the Dead Letter Queue."""
+        try:
+            dlq_data = {**data, "failure_reason": reason, "original_id": message_id}
+            await self.redis_client.xadd(
+                settings.REDIS_DLQ_STREAM_NAME,
+                dlq_data,
+                maxlen=settings.REDIS_STREAM_MAXLEN,
+                approximate=True
+            )
+            await self.redis_client.xack(self.stream_name, self.group_name, message_id)
+            logger.warning(f"⚠️ Message {message_id} moved to DLQ: {reason}")
+        except Exception as e:
+            logger.error(f"Failed to move message to DLQ: {e}")
+
+    async def claim_stale_messages(self):
+        """Claims messages that have been idle for too long."""
+        try:
+            # XAUTOCLAIM <stream> <group> <consumer> <min-idle-time> <start-id> [COUNT <count>]
+            result = await self.redis_client.xautoclaim(
+                name=self.stream_name,
+                groupname=self.group_name,
+                consumername=self.consumer_name,
+                min_idle_time=settings.REDIS_CLAIM_IDLE_TIME_MS,
+                start_id="0-0",
+                count=10
+            )
+            # result is [next_id, [messages], [deleted_ids]]
+            claimed_msgs = result[1]
+            if claimed_msgs:
+                logger.info(f"🕵️ Claimed {len(claimed_msgs)} stale messages from other consumers")
+                for message_id, data in claimed_msgs:
+                    asyncio.create_task(self.process_message(message_id, data))
+        except Exception as e:
+            logger.error(f"Error during XAUTOCLAIM: {e}")
+
     async def process_message(self, message_id, data):
-        """Executes a scraping task for a single stream message."""
+        """Executes a scraping task for a single stream message with retry protection."""
         async with self.semaphore:
+            # 1. Check delivery count for DLQ logic
+            try:
+                pending_info = await self.redis_client.xpending_range(
+                    self.stream_name, 
+                    self.group_name, 
+                    min=message_id, 
+                    max=message_id, 
+                    count=1
+                )
+                if pending_info:
+                    delivery_count = pending_info[0].get('times_delivered', 0)
+                    if delivery_count > settings.REDIS_MAX_RETRIES:
+                        await self.move_to_dlq(message_id, data, f"Max retries ({delivery_count}) exceeded")
+                        return
+            except Exception as e:
+                logger.error(f"Error checking delivery count for {message_id}: {e}")
+
             logger.info(f"🚀 Processing task {message_id}")
             logger.info(f"Task Data: {data}")
             
@@ -190,6 +247,9 @@ class RedisStreamReader:
                         asyncio.create_task(self.process_message(message_id, data))
 
             while True:
+                # Check for stale messages periodically (every loop iteration with block=5000 is approx 5s)
+                await self.claim_stale_messages()
+
                 messages = await self.redis_client.xreadgroup(
                     groupname=self.group_name,
                     consumername=self.consumer_name,

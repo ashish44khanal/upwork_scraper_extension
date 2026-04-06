@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     REDIS_STREAM_NAME: str = "upwork_jobs_stream"
+    REDIS_JOBS_STREAM_NAME: str = "upwork_jobs_stream"  # Standard name
     REDIS_GROUP_NAME: str = "scraper_group"
     REDIS_CONSUMER_NAME: str = "scraper_consumer_1"
     
@@ -33,12 +34,19 @@ class Settings(BaseSettings):
     
     # New extraction stream for downstream processing (published per card)
     EXTRACTION_STREAM_NAME: str = "upwork_job_extraction_stream"
+    REDIS_EXTRACTION_STREAM_NAME: str = "upwork_job_extraction_stream" # Standard name
     
     # Default search pages
     DEFAULT_SCRAPE_PAGES: int = 1
     
     # Storage settings
     STORAGE_DIR: str = "storage"
+
+    # Redis Stream Reliability Settings
+    REDIS_MAX_RETRIES: int = 5
+    REDIS_DLQ_STREAM_NAME: str = "upwork_failed_tasks_stream"
+    REDIS_STREAM_MAXLEN: int = 10000
+    REDIS_CLAIM_IDLE_TIME_MS: int = 900000  # 15 minutes
 
     # API Key for extraction logic
     GEMINI_API_KEY: Optional[str] = None

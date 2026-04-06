@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { JobCardEntity } from '../database/entities/job-card.entity';
@@ -14,11 +15,12 @@ export class ScrapeService {
     private readonly jobCardRepo: Repository<JobCardEntity>,
     @InjectRepository(ExtractedJobEntity)
     private readonly extractedJobRepo: Repository<ExtractedJobEntity>,
+    private readonly configService: ConfigService,
   ) {}
 
   async create(dto: CreateScrapeDto) {
-    const stream = 'upwork_jobs_stream';
-    const id = await this.redis.xadd(stream, '*', ...Object.entries(dto).flat());
+    const stream = this.configService.get<string>('REDIS_JOBS_STREAM_NAME', 'upwork_jobs_stream');
+    const id = await this.redis.xadd(stream, 'MAXLEN', '~', 10000, '*', ...Object.entries(dto).flat());
     return { id, stream, ...dto };
   }
 
@@ -149,6 +151,83 @@ export class ScrapeService {
     });
 
     return [headers.join(','), ...rows].join('\n');
+  }
+
+  async getExtractionSummary(url: string) {
+    if (!url || url.trim() === '') {
+      return { error: 'URL query parameter is required' };
+    }
+
+    const urlFilter = `%${url.trim()}%`;
+
+    // Get all job cards matching this scrape URL
+    const cardStats = await this.jobCardRepo
+      .createQueryBuilder('jc')
+      .select('jc.status', 'status')
+      .addSelect('COUNT(*)::int', 'count')
+      .where("jc.url ILIKE :url OR jc.metadata_json->>'parent_url' ILIKE :url", { url: urlFilter })
+      .groupBy('jc.status')
+      .getRawMany();
+
+    const statusCounts: Record<string, number> = {};
+    let totalCards = 0;
+    for (const row of cardStats) {
+      statusCounts[row.status] = row.count;
+      totalCards += row.count;
+    }
+
+    // Get extracted job count and sample data
+    const extractedCount = await this.extractedJobRepo
+      .createQueryBuilder('ej')
+      .innerJoin(JobCardEntity, 'jc', 'jc.event_id = ej.event_id')
+      .where("jc.url ILIKE :url OR jc.metadata_json->>'parent_url' ILIKE :url", { url: urlFilter })
+      .getCount();
+
+    // Get the latest few extracted jobs for a preview
+    const latestExtracted = await this.extractedJobRepo
+      .createQueryBuilder('ej')
+      .innerJoin(JobCardEntity, 'jc', 'jc.event_id = ej.event_id')
+      .where("jc.url ILIKE :url OR jc.metadata_json->>'parent_url' ILIKE :url", { url: urlFilter })
+      .orderBy('ej.scraped_at', 'DESC')
+      .limit(5)
+      .getMany();
+
+    // Determine overall pipeline status
+    let pipelineStatus = 'idle';
+    if (totalCards === 0) {
+      pipelineStatus = 'no_data';
+    } else if ((statusCounts['processing'] || 0) > 0) {
+      pipelineStatus = 'in_progress';
+    } else if ((statusCounts['captured'] || 0) > 0) {
+      pipelineStatus = 'pending_extraction';
+    } else if (extractedCount === totalCards) {
+      pipelineStatus = 'completed';
+    } else if ((statusCounts['failed'] || 0) > 0) {
+      pipelineStatus = 'partially_failed';
+    } else {
+      pipelineStatus = 'completed';
+    }
+
+    return {
+      url: url.trim(),
+      pipeline_status: pipelineStatus,
+      total_cards_scraped: totalCards,
+      total_extracted: extractedCount,
+      card_status_breakdown: {
+        captured: statusCounts['captured'] || 0,
+        processing: statusCounts['processing'] || 0,
+        extracted: statusCounts['extracted'] || 0,
+        failed: statusCounts['failed'] || 0,
+      },
+      completion_rate: totalCards > 0 ? `${Math.round((extractedCount / totalCards) * 100)}%` : '0%',
+      latest_extractions: latestExtracted.map(ej => ({
+        event_id: ej.event_id,
+        job_title: ej.job_title,
+        client_location: ej.client_location,
+        experience_level: ej.experience_level,
+        scraped_at: ej.scraped_at,
+      })),
+    };
   }
 
   findOne(id: number) { return {} }

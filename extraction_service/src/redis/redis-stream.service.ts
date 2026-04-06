@@ -13,6 +13,9 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RedisStreamService.name);
   private isRunning = false;
   private readonly batchSize = 5; // Handle multiple events in parallel
+  private readonly maxRetries = 5;
+  private readonly claimIdleTimeMs = 900000; // 15 minutes
+  private readonly dlqStreamName = 'upwork_failed_tasks_stream';
 
   constructor(
     private configService: ConfigService,
@@ -65,7 +68,7 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async listenToStream() {
-    const streamName = 'upwork_job_extraction_stream';
+    const streamName = this.configService.get<string>('REDIS_EXTRACTION_STREAM_NAME', 'upwork_job_extraction_stream');
     const groupName = 'extraction_service_group';
     const consumerName = `consumer_${process.pid}`;
 
@@ -79,20 +82,18 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
           'BLOCK', 5000,
           'STREAMS', streamName, '>'
         );
+        
+        // Stale Message Claiming
+        const claimed = await this.redis.xautoclaim(
+            streamName, groupName, consumerName,
+            this.claimIdleTimeMs, '0-0', 'COUNT', this.batchSize
+        );
+        const [nextId, claimedMessages] = claimed as any;
+        
+        const allMessages = [...(response ? (response as any)[0][1] : []), ...(claimedMessages || [])];
 
-        if (response && (response as any).length > 0) {
-          const messages = (response as any)[0][1];
-          
-          await Promise.all(messages.map(async ([streamId, fields]) => {
-            const eventId = fields[1]; // Assuming 'status' is field[0], val is field[1]... wait, XADD ID KEY VAL
-            // Actually fields is array [key, val, key, val]. 
-            // We pushed: xadd(stream, id, 'status', 'captured') -> id is the EventID (if we used it as ID) OR
-            // If we used auto-ID, the eventID is usually in the body or the ID itself is the eventID?
-            
-            // In trigger script: await redis.xadd(streamName, newId, 'status', 'captured');
-            // keys: ['status', 'captured']. The ID of message is newId.
-            // So streamId IS the eventId in our current design.
-            
+        if (allMessages.length > 0) {
+          await Promise.all(allMessages.map(async ([streamId, fields]) => {
             await this.processJob(streamId, streamId, groupName, streamName);
           }));
         }
@@ -120,6 +121,30 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
   private async processJob(eventId: string, streamMessageId?: string, groupName?: string, streamName?: string) {
     try {
       this.logger.log(`Processing job ${eventId} (StreamMsg: ${streamMessageId || 'N/A'})`);
+
+      // 0. Check delivery count for DLQ logic
+      if (streamMessageId && groupName && streamName) {
+        const pendingInfo = await this.redis.xpending(streamName, groupName, streamMessageId, streamMessageId, 1);
+        if (pendingInfo && pendingInfo.length > 0) {
+          const deliveryCount = (pendingInfo[0] as any)[3]; // index 3 is times delivered in xpending range
+          if (deliveryCount > this.maxRetries) {
+            this.logger.warn(`Max retries exceeded for ${eventId}. Moving to DLQ.`);
+            await this.jobCardRepository.update({ event_id: eventId }, { status: 'failed' });
+            
+            // Fetch job data for DLQ
+            const jobCard = await this.jobCardRepository.findOne({ where: { event_id: eventId } });
+            await this.redis.xadd(
+                this.dlqStreamName, 'MAXLEN', '~', 10000, '*',
+                'event_id', eventId,
+                'original_id', streamMessageId,
+                'reason', `Max retries (${deliveryCount}) exceeded`,
+                'data', JSON.stringify(jobCard || {})
+            );
+            await this.redis.xack(streamName, groupName, streamMessageId);
+            return;
+          }
+        }
+      }
 
       // 1. Attempt to lock the job by updating status to 'processing'
       // This prevents race conditions between Stream and Backlog processor
