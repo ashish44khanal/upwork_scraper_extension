@@ -28,7 +28,9 @@ export class ScrapeService {
     const { url, page = 1, limit = 10 } = query;
     const skip = (page - 1) * limit;
 
-    console.log(`[ScrapeService] Filtering by URL: "${url}"`);
+    // Normalize URL: trim, remove trailing slash, and handle space encoding variations
+    const normalizedUrl = url?.trim().replace(/\/$/, '').replace(/%20/g, '+');
+    console.log(`[ScrapeService] Filtering by URL: "${url}" (Normalized: "${normalizedUrl}")`);
 
     const queryBuilder = this.extractedJobRepo.createQueryBuilder('ej')
       .innerJoinAndSelect(JobCardEntity, 'jc', 'jc.event_id = ej.event_id');
@@ -36,7 +38,7 @@ export class ScrapeService {
     if (url && url.trim() !== '') {
       // Use ILIKE for both and be more permissive with metadata search
       queryBuilder.andWhere('(ej.job_url ILIKE :url OR jc.url ILIKE :url OR jc.metadata_json->>\'parent_url\' ILIKE :url)', { 
-        url: `%${url.trim()}%`
+        url: `%${normalizedUrl}%`
       });
     }
 
@@ -72,9 +74,10 @@ export class ScrapeService {
         'ej.*',
       ]);
 
+    const normalizedUrl = url?.trim().replace(/%20/g, '+');
     if (url && url.trim() !== '') {
       queryBuilder.andWhere('(jc.url ILIKE :url OR jc.metadata_json->>\'parent_url\' ILIKE :url)', { 
-        url: `%${url.trim()}%`
+        url: `%${normalizedUrl}%`
       });
     }
 
@@ -154,11 +157,9 @@ export class ScrapeService {
   }
 
   async getExtractionSummary(url: string) {
-    if (!url || url.trim() === '') {
-      return { error: 'URL query parameter is required' };
-    }
-
-    const urlFilter = `%${url.trim()}%`;
+    // Normalize URL: trim, remove trailing slash, and handle space encoding variations
+    const normalizedUrl = url?.trim().replace(/\/$/, '').replace(/%20/g, '+');
+    const urlFilter = `%${normalizedUrl}%`;
 
     // Get all job cards matching this scrape URL
     const cardStats = await this.jobCardRepo

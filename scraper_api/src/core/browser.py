@@ -91,7 +91,7 @@ async def review_browser() -> uc.Browser:
                 
                 # Ensure we have at least one "anchor" tab to keep the browser alive
                 if _browser_instance and not _browser_instance.tabs:
-                    await _browser_instance.get("about:blank")
+                    await _browser_instance.get("about:blank", new_tab=True)
                 
                 logger.info("✅ Browser instance started successfully.")
             except asyncio.TimeoutError:
@@ -117,7 +117,7 @@ async def get_tab() -> uc.Tab:
     Utility to get a fresh tab from the singleton browser.
     """
     browser = await review_browser()
-    return await browser.get("about:blank")
+    return await browser.get("about:blank", new_tab=True)
 
 async def verify_cf(tab: uc.Tab):
     """
