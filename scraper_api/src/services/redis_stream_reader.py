@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import gc
 import redis
 import redis.asyncio as aioredis
 from datetime import datetime
@@ -24,7 +25,9 @@ class RedisStreamReader:
         self.redis_client = None
         
         # Concurrency control
-        self.semaphore = asyncio.Semaphore(1)
+        self.semaphore = asyncio.Semaphore(settings.SCRAPER_CONCURRENCY)
+        self.is_running = True
+        self.last_claim_time = 0
         
         # Redis config
         self.stream_name = settings.REDIS_STREAM_NAME
@@ -90,7 +93,7 @@ class RedisStreamReader:
             
             logger.info(f"✅ Saved card {card_index} to DB with predictable ID: {predictable_id}")
 
-            # 3. Publish event to extraction stream with the EXACT same ID
+            # 3. Publish event to extraction stream
             event_data = {
                 "event_id": predictable_id,
                 "card_db_id": str(card_db_id),
@@ -102,27 +105,14 @@ class RedisStreamReader:
                 "timestamp": datetime.now().isoformat()
             }
             
-            # Try with predictable ID first, fallback to '*' if it fails (e.g. ID already exists)
-            try:
-                msg_id = await self.redis_client.xadd(
-                    settings.EXTRACTION_STREAM_NAME, 
-                    event_data,
-                    id=predictable_id,
-                    maxlen=settings.REDIS_STREAM_MAXLEN,
-                    approximate=True
-                )
-            except redis.ResponseError as re:
-                if "equal or smaller" in str(re):
-                    logger.warning(f"⚠️ ID collision for {predictable_id}, falling back to auto-increment")
-                    msg_id = await self.redis_client.xadd(
-                        settings.EXTRACTION_STREAM_NAME, 
-                        event_data,
-                        id="*",
-                        maxlen=settings.REDIS_STREAM_MAXLEN,
-                        approximate=True
-                    )
-                else:
-                    raise re
+            # Use auto-generated ID (*) for Redis, and keep event_id in payload for sync
+            msg_id = await self.redis_client.xadd(
+                settings.EXTRACTION_STREAM_NAME, 
+                event_data,
+                id="*",
+                maxlen=settings.REDIS_STREAM_MAXLEN,
+                approximate=True
+            )
             
             logger.info(f"📤 Published extraction event: {msg_id}")
 
@@ -140,12 +130,18 @@ class RedisStreamReader:
                 approximate=True
             )
             await self.redis_client.xack(self.stream_name, self.group_name, message_id)
-            logger.warning(f"⚠️ Message {message_id} moved to DLQ: {reason}")
+            await self.redis_client.xdel(self.stream_name, message_id)
+            logger.warning(f"⚠️ Message {message_id} moved to DLQ and removed from stream: {reason}")
         except Exception as e:
             logger.error(f"Failed to move message to DLQ: {e}")
 
     async def claim_stale_messages(self):
-        """Claims messages that have been idle for too long."""
+        """Claims messages that have been idle for too long, throttled by config."""
+        now = asyncio.get_event_loop().time()
+        if now - self.last_claim_time < settings.REDIS_CLAIM_INTERVAL_SECONDS:
+            return
+        
+        self.last_claim_time = now
         try:
             # XAUTOCLAIM <stream> <group> <consumer> <min-idle-time> <start-id> [COUNT <count>]
             result = await self.redis_client.xautoclaim(
@@ -190,7 +186,8 @@ class RedisStreamReader:
             
             # If 'pages' isn't provided, we pass None to let the scraper auto-detect
             url = data.get("page_url")
-            raw_pages = data.get("pages")
+            # Support both 'no_of_pages_to_scrape' (from DTO) and legacy 'pages' key
+            raw_pages = data.get("no_of_pages_to_scrape") or data.get("pages")
             pages = int(raw_pages) if raw_pages else None
             
             # Allow resuming from a specific page (None allows URL-based detection)
@@ -213,12 +210,16 @@ class RedisStreamReader:
                 )
                 
                 await self.redis_client.xack(self.stream_name, self.group_name, message_id)
-                logger.info(f"✅ Completed task {message_id}")
+                await self.redis_client.xdel(self.stream_name, message_id)
+                logger.info(f"✅ Completed and cleaned up task {message_id}")
             except Exception as e:
                 logger.error(f"❌ Task {message_id} failed: {e}")
+                # If it's a browser/connection error, ensure we reset the singleton
+                if "WebSocket" in str(e) or "connection" in str(e).lower() or "500" in str(e):
+                    await close_browser()
             finally:
-                # We don't force close the singleton here unless specifically needed
-                pass
+                # Basic cleanup
+                gc.collect()
 
     async def run(self):
         """Main loop: listens for new messages in the stream."""
@@ -246,15 +247,15 @@ class RedisStreamReader:
                     for message_id, data in msgs:
                         asyncio.create_task(self.process_message(message_id, data))
 
-            while True:
-                # Check for stale messages periodically (every loop iteration with block=5000 is approx 5s)
+            while self.is_running:
+                # Check for stale messages periodically 
                 await self.claim_stale_messages()
 
                 messages = await self.redis_client.xreadgroup(
                     groupname=self.group_name,
                     consumername=self.consumer_name,
                     streams={self.stream_name: ">"},
-                    count=1,
+                    count=settings.SCRAPER_CONCURRENCY,
                     block=5000
                 )
                 if not messages: continue
@@ -262,6 +263,9 @@ class RedisStreamReader:
                 for stream, msgs in messages:
                     for message_id, data in msgs:
                         asyncio.create_task(self.process_message(message_id, data))
+        except asyncio.CancelledError:
+            logger.info("🛑 Consumer loop cancelled")
+            self.is_running = False
         finally:
             # Global cleanup of redis connection
             if self.redis_client:

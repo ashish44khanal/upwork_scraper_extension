@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -6,9 +6,12 @@ import { JobCardEntity } from '../database/entities/job-card.entity';
 import { ExtractedJobEntity } from '../database/entities/extracted-job.entity';
 import { CreateScrapeDto } from './dto/create-scrape.dto';
 import Redis from 'ioredis';
+import * as crypto from 'crypto';
 
 @Injectable()
 export class ScrapeService {
+  private readonly logger = new Logger(ScrapeService.name);
+
   constructor(
     @Inject('REDIS_CLIENT') private readonly redis: Redis,
     @InjectRepository(JobCardEntity)
@@ -19,9 +22,40 @@ export class ScrapeService {
   ) {}
 
   async create(dto: CreateScrapeDto) {
-    const stream = this.configService.get<string>('REDIS_JOBS_STREAM_NAME', 'upwork_jobs_stream');
-    const id = await this.redis.xadd(stream, 'MAXLEN', '~', 10000, '*', ...Object.entries(dto).flat());
-    return { id, stream, ...dto };
+    try {
+      const rawUrl = dto.page_url || (dto as any).url;
+      if (!rawUrl) {
+        throw new Error('URL is required for scraping');
+      }
+      const url = String(rawUrl);
+
+      // 1. Generate a unique lock key for this URL
+      const urlHash = crypto.createHash('md5').update(url).digest('hex');
+      const lockKey = `scrape_lock:${urlHash}`;
+
+      // 2. Check if a lock already exists
+      const existingJobId = await this.redis.get(lockKey);
+      if (existingJobId) {
+        this.logger.log(`[ScrapeService] URL already being processed. Returning existing Job ID: ${existingJobId}`);
+        return { id: existingJobId, stream: 'upwork_jobs_stream', ...dto, already_processing: true };
+      }
+
+      const stream = this.configService.get<string>('REDIS_JOBS_STREAM_NAME', 'upwork_jobs_stream');
+      const id = await this.redis.xadd(stream, 'MAXLEN', '~', 10000, '*', ...Object.entries(dto).flat());
+      if (!id) {
+        throw new Error('Failed to create Redis stream event: ID is null');
+      }
+      
+      // 3. Set the lock with a 15-minute TTL (safety buffer)
+      // The lock will be released by the extraction service upon completion
+      await this.redis.set(lockKey, id, 'EX', 900); 
+
+      this.logger.log(`[ScrapeService] Job created in stream ${stream}: ${id}`);
+      return { id, stream, ...dto };
+    } catch (error) {
+      this.logger.error(`[ScrapeService] Failed to create scrape job: ${error.message}`);
+      throw error;
+    }
   }
 
   async findExtractedValues(query: { url?: string; page?: number; limit?: number }) {

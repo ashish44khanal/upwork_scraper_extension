@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     REDIS_DLQ_STREAM_NAME: str = "upwork_failed_tasks_stream"
     REDIS_STREAM_MAXLEN: int = 10000
     REDIS_CLAIM_IDLE_TIME_MS: int = 900000  # 15 minutes
+    REDIS_CLAIM_INTERVAL_SECONDS: int = 60  # Only check for stale messages every minute
+    SCRAPER_CONCURRENCY: int = 2  # Number of concurrent browser tasks
 
     # API Key for extraction logic
     GEMINI_API_KEY: Optional[str] = None

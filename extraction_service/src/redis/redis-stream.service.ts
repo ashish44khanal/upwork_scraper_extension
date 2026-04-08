@@ -1,4 +1,5 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
+import * as crypto from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
 import { ManualExtractionService } from '../extraction/manual-extraction.service';
@@ -12,9 +13,11 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
   private redis: Redis;
   private readonly logger = new Logger(RedisStreamService.name);
   private isRunning = false;
-  private readonly batchSize = 5; // Handle multiple events in parallel
+  private readonly batchSize = 10; // Handle multiple events in parallel
   private readonly maxRetries = 5;
   private readonly claimIdleTimeMs = 900000; // 15 minutes
+  private readonly claimIntervalMs = 30000; // 30 seconds
+  private lastClaimTime = 0;
   private readonly dlqStreamName = 'upwork_failed_tasks_stream';
 
   constructor(
@@ -49,18 +52,37 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
   async processBacklog() {
     this.logger.log('Starting backlog processing for captured jobs...');
     try {
-      // Fetch all validation jobs that are captured but not extracted
-      const pendingJobs = await this.jobCardRepository.find({
-        where: { status: 'captured' },
-        select: ['event_id'] 
-      });
+      const pageSize = 50;
+      let offset = 0;
+      let hasMore = true;
 
-      this.logger.log(`Found ${pendingJobs.length} pending jobs in backlog.`);
+      while (hasMore && this.isRunning) {
+        const pendingJobs = await this.jobCardRepository.find({
+          where: { status: 'captured' },
+          select: ['event_id'],
+          skip: offset,
+          take: pageSize,
+          order: { created_at: 'ASC' } as any
+        });
 
-      for (const job of pendingJobs) {
-        if (!this.isRunning) break;
-        await this.processJob(job.event_id);
+        if (pendingJobs.length === 0) {
+          hasMore = false;
+          break;
+        }
+
+        this.logger.log(`Processing backlog batch: ${offset} to ${offset + pendingJobs.length}`);
+        
+        // Process this batch in parallel with the configured batchSize concurrency
+        for (let i = 0; i < pendingJobs.length; i += this.batchSize) {
+            const batch = pendingJobs.slice(i, i + this.batchSize);
+            await Promise.all(batch.map(job => this.processJob(job.event_id)));
+        }
+
+        offset += pendingJobs.length;
+        // If we got fewer than pageSize, it was the last page
+        if (pendingJobs.length < pageSize) hasMore = false;
       }
+      
       this.logger.log('Backlog processing completed.');
     } catch (err) {
       this.logger.error(`Error processing backlog: ${err.message}`);
@@ -83,18 +105,31 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
           'STREAMS', streamName, '>'
         );
         
-        // Stale Message Claiming
-        const claimed = await this.redis.xautoclaim(
-            streamName, groupName, consumerName,
-            this.claimIdleTimeMs, '0-0', 'COUNT', this.batchSize
-        );
-        const [nextId, claimedMessages] = claimed as any;
+        // Stale Message Claiming (Throttled)
+        const now = Date.now();
+        let claimedMessages = [];
+        if (now - this.lastClaimTime > this.claimIntervalMs) {
+            const claimed = await this.redis.xautoclaim(
+                streamName, groupName, consumerName,
+                this.claimIdleTimeMs, '0-0', 'COUNT', this.batchSize
+            );
+            const [nextId, msgs] = claimed as any;
+            claimedMessages = msgs || [];
+            this.lastClaimTime = now;
+        }
         
-        const allMessages = [...(response ? (response as any)[0][1] : []), ...(claimedMessages || [])];
+        const allMessages = [...(response ? (response as any)[0][1] : []), ...claimedMessages];
 
         if (allMessages.length > 0) {
           await Promise.all(allMessages.map(async ([streamId, fields]) => {
-            await this.processJob(streamId, streamId, groupName, streamName);
+            // Extraction service logic: fields are usually key-value pairs
+            // If we use payload-based ID, it should be in the fields
+            const data: Record<string, string> = {};
+            for (let i = 0; i < fields.length; i += 2) {
+                data[fields[i]] = fields[i+1];
+            }
+            const eventId = data.event_id || streamId;
+            await this.processJob(eventId, streamId, groupName, streamName);
           }));
         }
       }
@@ -141,6 +176,7 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
                 'data', JSON.stringify(jobCard || {})
             );
             await this.redis.xack(streamName, groupName, streamMessageId);
+            await this.redis.xdel(streamName, streamMessageId);
             return;
           }
         }
@@ -161,6 +197,7 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
                 this.logger.log(`Job ${eventId} already extracted. Skipping.`);
                 if (streamMessageId && groupName && streamName) {
                     await this.redis.xack(streamName, groupName, streamMessageId);
+                    await this.redis.xdel(streamName, streamMessageId);
                 }
                 return;
              }
@@ -175,6 +212,7 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
                 // If not in DB, we can't extract. Ack to remove from pending? Or keep?
                 // For now, Ack to avoid infinite loops if it's a ghost event.
                 await this.redis.xack(streamName, groupName, streamMessageId);
+                await this.redis.xdel(streamName, streamMessageId);
              }
              return;
         }
@@ -201,19 +239,35 @@ export class RedisStreamService implements OnModuleInit, OnModuleDestroy {
         await transactionalEntityManager.update(JobCardEntity, { id: jobCard.id }, { status: 'extracted' });
       });
 
-      // 5. Ack Stream if applicable
+      // 5. Release Lock
+      try {
+        const urlHash = crypto.createHash('md5').update(jobCard.url).digest('hex');
+        await this.redis.del(`scrape_lock:${urlHash}`);
+      } catch (e) {
+        this.logger.error(`Failed to release lock for ${jobCard.url}: ${e.message}`);
+      }
+
+      // 6. Ack Stream if applicable
       if (streamMessageId && groupName && streamName) {
         await this.redis.xack(streamName, groupName, streamMessageId);
+        await this.redis.xdel(streamName, streamMessageId);
       }
 
       this.logger.log(`Successfully extracted job: ${eventId}`);
 
     } catch (err) {
       this.logger.error(`Error processing job ${eventId}: ${err.message}`);
-      // Revert status to 'captured' so it can be retried?
-      // For now, leave as processing or maybe 'failed'.
-      // Only revert if we want retry.
+      // Revert status to 'captured' so it can be retried
       await this.jobCardRepository.update({ event_id: eventId }, { status: 'captured' });
+      
+      // Release lock on error to allow retry
+      try {
+        const jobCard = await this.jobCardRepository.findOne({ where: { event_id: eventId } });
+        if (jobCard) {
+            const urlHash = crypto.createHash('md5').update(jobCard.url).digest('hex');
+            await this.redis.del(`scrape_lock:${urlHash}`);
+        }
+      } catch (e) {}
     }
   }
 }
