@@ -16,6 +16,8 @@ from src.core.browser import get_tab, verify_cf, close_browser
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
+# Suppress noisy nodriver connection logs (e.g., CDP parsing KeyErrors)
+logging.getLogger("nodriver.core.connection").setLevel(logging.ERROR)
 
 class ScraperException(Exception):
     """Base exception for scraper errors."""
