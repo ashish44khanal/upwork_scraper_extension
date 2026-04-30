@@ -56,9 +56,8 @@ class RedisStreamReader:
             stream_id = kwargs.get("stream_id") # e.g., 1771075644552-0
             page_num = kwargs.get("page_num")
             card_index = kwargs.get("card_index")
-            filtered_html = kwargs.get("filtered_html")
+            raw_html = kwargs.get("raw_html")
             url = kwargs.get("url")
-            extraction_mode = kwargs.get("extraction_mode", "manual")
             
             # 1. Construct Predictable ID
             # Redis stream IDs are timestamp-sequence (e.g., 1771075644552-0)
@@ -75,12 +74,11 @@ class RedisStreamReader:
                     event_id=predictable_id,  # Use predictable ID for lookup
                     url=url,
                     status="captured",
-                    html_content=filtered_html,
+                    html_content=raw_html,
                     metadata_json={
                         "original_task_id": stream_id,
                         "page_num": page_num,
-                        "card_index": card_index,
-                        "extraction_mode": extraction_mode
+                        "card_index": card_index
                     }
                 )
                 session.add(new_card)
@@ -98,7 +96,6 @@ class RedisStreamReader:
                 "card_index": str(card_index),
                 "page_num": str(page_num),
                 "url": url,
-                "extraction_mode": extraction_mode,
                 "status": "card_captured",
                 "timestamp": datetime.now().isoformat()
             }
@@ -136,26 +133,26 @@ class RedisStreamReader:
             url = data.get("page_url")
             raw_pages = data.get("pages")
             pages = int(raw_pages) if raw_pages else None
-            logger.info(f"Requested Pages: {pages if pages else 'Auto-detect'} (Raw value: {raw_pages})")
             
-            mode = data.get("extraction_mode", "manual")
-
+            # Allow resuming from a specific page (None allows URL-based detection)
+            start_page_raw = data.get("start_page")
+            start_page = int(start_page_raw) if start_page_raw else None
+            
+            logger.info(f"Requested Pages: {pages if pages else 'Auto-detect'} (Start at: {start_page or 'URL-based'})")
+            
             # Create an independent browser instance for this specific task
             browser_manager = BrowserManager(headless=False, session_id=message_id)
             scraper = UpworkScraper(browser_manager)
             
             try:
-                async def callback(**kwargs):
-                    await self._on_card_data(
-                        stream_id=message_id, 
-                        extraction_mode=mode, 
-                        **kwargs
-                    )
-
                 await scraper.scrape_jobs(
                     product_url=url,
                     no_of_pages_to_scrape=pages,
-                    on_card_data_async=callback
+                    start_at_page=start_page,
+                    on_card_data_async=lambda **kwargs: self._on_card_data(
+                        stream_id=message_id, 
+                        **kwargs
+                    )
                 )
                 
                 await self.redis_client.xack(self.stream_name, self.group_name, message_id)

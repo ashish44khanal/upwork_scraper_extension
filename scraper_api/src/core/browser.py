@@ -1,6 +1,8 @@
 import asyncio
 import os
 import logging
+import psutil
+import signal
 import nodriver as uc
 from nodriver import cdp
 from typing import Optional, List
@@ -68,6 +70,7 @@ class BrowserManager:
                 if attempt < max_retries:
                     logger.warning(f"Browser launch attempt {attempt+1} failed: {e}. Retrying cleanup...")
                     self._cleanup_stale_locks()
+                    await self._force_kill_chrome() # Aggressive cleanup
                     await asyncio.sleep(2)
                 else:
                     logger.error(f"Critical failure launching browser {self.session_id}: {e}")
@@ -86,6 +89,22 @@ class BrowserManager:
             except Exception as e:
                 logger.warning(f"Could not remove lock file for {self.session_id}: {e}")
 
+    async def _force_kill_chrome(self):
+        """Aggressively finds and kills all Chrome processes associated with this profile."""
+        logger.info(f"Aggressively cleaning up Chrome processes for session {self.session_id}...")
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # Check if it's a chrome process and contains our profile path
+                    cmdline = proc.info.get('cmdline')
+                    if cmdline and any('chrome' in s.lower() for s in cmdline) and any(self.profile_path in s for s in cmdline):
+                        logger.warning(f"Killing orphan Chrome process {proc.info['pid']} for profile {self.session_id}")
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception as e:
+            logger.error(f"Error during force-kill: {e}")
+
     async def close(self):
         """Shutdown the browser instance managed by this manager."""
         async with self._lock:
@@ -93,22 +112,25 @@ class BrowserManager:
                 try:
                     logger.info(f"Closing browser session {self.session_id} gracefully...")
                     self._shutdown_event.set()
-                    if self._browser:
-                        # Safely try to stop the browser
-                        stop_method = getattr(self._browser, 'stop', None)
-                        if stop_method:
-                            try:
-                                # Start the stop call
-                                stop_call = stop_method()
-                                # Only await if it's actually a coroutine
-                                if asyncio.iscoroutine(stop_call) or hasattr(stop_call, '__await__'):
-                                    await stop_call
-                            except Exception as stop_err:
-                                logger.debug(f"Inner stop error for {self.session_id}: {stop_err}")
+                    # Safely try to stop the browser
+                    stop_method = getattr(self._browser, 'stop', None)
+                    if stop_method:
+                        try:
+                            stop_call = stop_method()
+                            if asyncio.iscoroutine(stop_call) or hasattr(stop_call, '__await__'):
+                                await asyncio.wait_for(stop_call, timeout=5.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Browser stop for {self.session_id} timed out. Proceeding to force kill.")
+                        except Exception as stop_err:
+                            logger.debug(f"Inner stop error for {self.session_id}: {stop_err}")
                 except Exception as e:
                     logger.warning(f"Error during browser shutdown for {self.session_id}: {e}")
                 finally:
                     self._browser = None
+                    # Aggressive cleanup of any lingering renderers
+                    await self._force_kill_chrome()
+                    await asyncio.sleep(1.0)
+                    self._cleanup_stale_locks()
 
     async def create_tab(self) -> uc.Tab:
         """Create a new tab in this browser."""

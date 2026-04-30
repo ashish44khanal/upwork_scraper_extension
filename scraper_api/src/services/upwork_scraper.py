@@ -41,9 +41,22 @@ class UpworkScraper:
         self, 
         product_url: str, 
         no_of_pages_to_scrape: Optional[int] = None, 
-        on_card_data_async: Optional[Callable] = None
+        on_card_data_async: Optional[Callable] = None,
+        start_at_page: Optional[int] = None
     ):
         """Main entry point for scraping jobs from a search URL."""
+        # 1. Page Detection (URL > Explicit Param > Default 1)
+        url_page = self._extract_page_from_url(product_url)
+        current_session_start_page = start_at_page if start_at_page is not None else (url_page or 1)
+        
+        # State tracking for resume/restart
+        self._current_page = current_session_start_page
+        self._last_tile_idx = -1 # Index within the current page (0-based)
+        self._total_scraped_in_session = 0
+        
+        # Resource management
+        RESTART_RECORD_THRESHOLD = 100 # Total records before forced browser restart
+        
         tab = await self.browser_manager.create_tab()
         
         try:
@@ -77,33 +90,64 @@ class UpworkScraper:
             total_pages = await self._determine_total_pages(tab)
             logger.info(f"📊 Final Total Pages Found: {total_pages}")
 
-            if no_of_pages_to_scrape:
-                pages_to_process = min(no_of_pages_to_scrape, total_pages)
-                logger.info(f"🔢 User requested {no_of_pages_to_scrape} pages. Processing {pages_to_process}.")
-            else:
-                pages_to_process = total_pages
-                logger.info(f"🔢 No page limit set. Processing all {pages_to_process} detected pages.")
-            
-            logger.info(f"[Session: {self.session_id}] Final plan: Scraping {pages_to_process} pages from {product_url}")
+            pages_to_process = total_pages
+            while self._current_page <= pages_to_process:
+                page_num = self._current_page
+                
+                # Check for periodic restart to prevent browser "hangs"
+                if self._total_scraped_in_session >= RESTART_RECORD_THRESHOLD:
+                    logger.info(f"♻️ Force-restarting browser after {self._total_scraped_in_session} records to clear memory leaks...")
+                    await tab.close()
+                    await self.browser_manager.close()
+                    tab = await self.browser_manager.create_tab()
+                    # Re-enable interception on new tab
+                    await tab.send(cdp.network.enable())
+                    tab.add_handler(cdp.network.ResponseReceived, handler)
+                    self._total_scraped_in_session = 0
+                    # Re-login if needed
+                    await tab.get("https://www.upwork.com/nx/find-work/best-matches")
+                    await self.wait_for_cloudflare(tab)
+                    if "login" in tab.url or await self._is_login_page(tab):
+                        await self._perform_login(tab)
 
-            for page_num in range(1, pages_to_process + 1):
                 logger.info(f"🚀 [Page {page_num}/{pages_to_process}] Starting scrape...")
                 
-                if page_num > 1:
-                    next_url = self._build_next_page_url(product_url, page_num)
-                    logger.info(f"⏭️ Navigating to Page {page_num}: {next_url}")
-                    await tab.get(next_url)
-                    await self.wait_for_cloudflare(tab)
-                    # Reset pagination event for each new page if we want fresh interception
-                    self._pagination_event.clear()
+                max_retries = 2
+                for attempt in range(max_retries + 1):
+                    try:
+                        # Build target URL for this page
+                        target_url = self._build_next_page_url(product_url, page_num)
+                        
+                        # Navigate if not already there (including retries/restarts)
+                        if tab.url != target_url:
+                            logger.info(f"⏭️ Navigating to Page {page_num} (Attempt {attempt+1}): {target_url}")
+                            await tab.get(target_url)
+                            await self.wait_for_cloudflare(tab)
+                            self._pagination_event.clear()
+                            await asyncio.sleep(random.uniform(2.0, 5.0))
 
-                await self._scrape_page(tab, page_num, on_card_data_async)
-                logger.info(f"✅ [Page {page_num}/{pages_to_process}] Finished.")
+                        # Process the page, starting from the last known tile index if we just restarted
+                        await self._scrape_page(tab, page_num, on_card_data_async, resume_from_idx=self._last_tile_idx + 1)
+                        
+                        # Reset tile index for next page
+                        self._last_tile_idx = -1
+                        self._current_page += 1
+                        logger.info(f"✅ [Page {page_num}/{pages_to_process}] Finished.")
+                        break # Success, move to next page
+                    except Exception as e:
+                        if attempt < max_retries:
+                            logger.warning(f"⚠️ Error on Page {page_num} (Attempt {attempt+1}): {e}. Retrying with refresh...")
+                            await asyncio.sleep(random.uniform(5.0, 10.0))
+                            # Re-fetch the page on next attempt loop
+                        else:
+                            logger.error(f"❌ Page {page_num} failed after {max_retries+1} attempts. Skipping page.")
+                            self._current_page += 1
+                            self._last_tile_idx = -1
 
         finally:
             await tab.close()
 
-    async def _scrape_page(self, tab: uc.Tab, page_num: int, callback: Optional[Callable]):
+    async def _scrape_page(self, tab: uc.Tab, page_num: int, callback: Optional[Callable], resume_from_idx: int = 0):
         """Processes all job tiles on a single search result page."""
         # 1. Wait for tiles to load initially
         initial_tiles = await self._wait_for_tiles(tab)
@@ -112,6 +156,12 @@ class UpworkScraper:
         
         for i in range(count):
             card_index = i + 1
+            
+            # Resume logic: Skip tiles already processed on this page
+            if i < resume_from_idx:
+                logger.info(f"⏭️ Skipping Page {page_num}, Tile {card_index}/{count} (already processed)")
+                continue
+
             logger.info(f"Processing Page {page_num}, Tile {card_index}/{count}")
             
             try:
@@ -125,28 +175,51 @@ class UpworkScraper:
                     
                 tile = current_tiles[i]
                 
-                # 3. Scrape the tile
-                job_html = await self._scrape_tile(tab, tile)
-                
+                # 3. Scrape the tile with internal retry for node stability
+                tile_retries = 2
+                job_html = None
+                for t_attempt in range(tile_retries + 1):
+                    try:
+                        job_html = await self._scrape_tile(tab, tile, card_index)
+                        if job_html: break # Success
+                        
+                        if t_attempt < tile_retries:
+                            logger.warning(f"  - Empty HTML for tile {card_index} (Attempt {t_attempt+1}). Retrying...")
+                            await asyncio.sleep(random.uniform(2.0, 4.0))
+                            # Re-fetch tiles in case DOM updated
+                            current_tiles = await tab.select_all(self.TILE_SELECTOR)
+                            if i < len(current_tiles): tile = current_tiles[i]
+                    except Exception as te:
+                        if t_attempt < tile_retries:
+                            logger.warning(f"  - Error scraping tile {card_index} (Attempt {t_attempt+1}): {te}. Retrying...")
+                            await asyncio.sleep(random.uniform(2.0, 4.0))
+                            current_tiles = await tab.select_all(self.TILE_SELECTOR)
+                            if i < len(current_tiles): tile = current_tiles[i]
+                        else:
+                            raise te
+
                 if job_html and callback:
-                    filtered_html = self._clean_html(job_html)
                     await callback(
                         card_index=card_index,
                         page_num=page_num,
                         raw_html=job_html,
-                        filtered_html=filtered_html,
                         url=tab.url
                     )
                 
-                # 4. Small delay between tiles to be human-like and let UI settle
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                # Update persistent state
+                self._last_tile_idx = i
+                self._total_scraped_in_session += 1
+                
+                # 4. Human-like delay between tiles
+                await asyncio.sleep(random.uniform(3.0, 6.0))
                 
             except Exception as e:
                 logger.error(f"Error scraping tile {card_index} on page {page_num}: {e}")
                 # Try to recover by closing any open modal
                 await self._close_modal(tab, tab)
+                await asyncio.sleep(random.uniform(1.0, 2.0))
 
-    async def _scrape_tile(self, tab: uc.Tab, tile: uc.Element) -> Optional[str]:
+    async def _scrape_tile(self, tab: uc.Tab, tile: uc.Element, card_index: int) -> Optional[str]:
         """Clicks a single job tile and extracts the content from the modal."""
         await tile.scroll_into_view()
         await tile.click()
@@ -156,12 +229,16 @@ class UpworkScraper:
         if not slider_appeared:
             return None
         
+        # More human-like jitter before interaction
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+        
         # Wait for "Save job" text to ensure modal is loaded
-        save_job_visible = await self._wait_for_text(tab, "Save job", timeout=5.0)
+        save_job_visible = await self._wait_for_text(tab, "Save job", timeout=8.0)
         if not save_job_visible:
-            logger.warning(f"  - 'Save job' button not found for tile {card_index}, but proceeding...")
+            logger.warning(f"  - 'Save job' button not found for tile {card_index}, waiting extra...")
+            await asyncio.sleep(2.0)
             
-        await asyncio.sleep(random.uniform(0.5, 1.0)) # Jitter
+        await asyncio.sleep(random.uniform(1.5, 2.5)) # Hesitate-like delay
         
         # Extract content
         try:
@@ -206,12 +283,12 @@ class UpworkScraper:
             await asyncio.sleep(3.0)
             
             # Capture debug screenshot
-            try:
-                debug_path = f"storage/debug_pagination_{self.session_id}.jpg"
-                await tab.save_screenshot(filename=debug_path)
-                logger.info(f"📸 Debug screenshot saved: {debug_path}")
-            except Exception as e:
-                logger.warning(f"Screenshot failed: {e}")
+            # try:
+            #     debug_path = f"storage/debug_pagination_{self.session_id}.jpg"
+            #     await tab.save_screenshot(filename=debug_path)
+            #     logger.info(f"📸 Debug screenshot saved: {debug_path}")
+            # except Exception as e:
+            #     logger.warning(f"Screenshot failed: {e}")
 
             # STRATEGY 1: .sr-only elements
             logger.info("📋 Strategy 1: Scanning .sr-only elements...")
@@ -360,25 +437,40 @@ class UpworkScraper:
     async def _close_modal(self, tab: uc.Tab, context):
         """Closes the job details slider."""
         try:
+            # Try to find and click the close button
             close_btn = await context.select('button.air3-slider-prev-btn', timeout=1)
-            if close_btn: await close_btn.click()
-            else: await tab.send_keys("\uE00C") # Escape key
-        except:
-            await tab.send_keys("\uE00C")
+            if close_btn:
+                await close_btn.click()
+            else:
+                # Fallback: Send Escape key via JavaScript
+                await tab.evaluate('window.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true}));')
+        except Exception as e:
+            logger.debug(f"Modal close attempt failed: {e}")
+            try:
+                await tab.evaluate('window.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true}));')
+            except:
+                pass
 
     def _build_next_page_url(self, base_url: str, page_num: int) -> str:
         """Query string builder for pagination."""
         parsed = urlparse(base_url)
         qs = parse_qs(parsed.query)
         qs["page"] = [str(page_num)]
+        # Ensure we don't have conflicting nbs/q being duplicated
         return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
 
-    def _clean_html(self, html: str) -> str:
-        """Simplified HTML cleaner focusing on relevant content."""
-        if not html: return ""
-        # Find the main job description part to keep it lean
-        match = re.search(r'(<section[^>]*class="[^"]*job-details[^"]*"[^>]*>.*?</section>)', html, re.DOTALL | re.IGNORECASE)
-        return match.group(1) if match else html
+    def _extract_page_from_url(self, url: str) -> Optional[int]:
+        """Extracts the page number from an Upwork search URL."""
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            page_val = qs.get("page")
+            if page_val:
+                return int(page_val[0])
+        except Exception as e:
+            logger.debug(f"Failed to extract page from URL: {e}")
+        return None
+
 
     async def wait_for_cloudflare(self, tab: uc.Tab):
         """Helper to wait for Cloudflare challenges."""
